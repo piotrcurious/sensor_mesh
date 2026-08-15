@@ -27,6 +27,12 @@
 // PWM Output Pin (e.g., GPIO 5 / D1 on NodeMCU/Wemos D1 Mini)
 #define PWM_PIN D1
 
+// Digital Input Pin (sending node)
+#define DIGITAL_INPUT_PIN D2
+
+// Digital Output Pin (receiving node)
+#define DIGITAL_OUTPUT_PIN D3
+
 // PWM resolution max value (0 to 1023 for ESP8266 default analogWrite range)
 #define PWM_RANGE 1023
 
@@ -49,11 +55,12 @@
 // ============================================================================
 
 struct __attribute__((__packed__)) SensorMessage {
-    uint8_t  magic;        // Magic header byte (0xA5)
-    uint16_t sender_id;    // Custom compile-time sender node ID
-    uint16_t target_id;    // Custom compile-time target node ID
-    uint16_t sensor_value; // Analog sensor value (0-1023)
-    uint32_t seq;          // Message sequence counter
+    uint8_t  magic;          // Magic header byte (0xA5)
+    uint16_t sender_id;      // Custom compile-time sender node ID
+    uint16_t target_id;      // Custom compile-time target node ID
+    uint16_t sensor_value;   // Analog sensor value (0-1023)
+    uint8_t  digital_value;  // Digital input state (0 or 1 from D2)
+    uint32_t seq;            // Message sequence counter
 };
 
 #endif // CONFIG_H

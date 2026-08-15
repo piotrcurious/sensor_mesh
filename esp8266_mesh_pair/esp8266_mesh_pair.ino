@@ -1,10 +1,11 @@
 /*
   ESP8266 Bi-directional Sensor Mesh Node Firmware
   Uses painlessMesh to create an auto-organizing mesh network.
-  Reads analog input pin (A0) every 1 second and transmits compact binary packed struct data
-  (HEX encoded to safely pass through JSON mesh frames) to a paired node
-  (configured via MY_NODE_ID and TARGET_NODE_ID).
-  When receiving messages addressed to MY_NODE_ID, sets PWM output pin.
+  Reads analog input pin (A0) and digital input pin (D2) every 1 second and transmits
+  compact binary packed struct data (HEX encoded) to a paired node (configured via
+  MY_NODE_ID and TARGET_NODE_ID).
+  When receiving messages addressed to MY_NODE_ID, sets PWM output pin (D1) and
+  digital output pin (D3).
 */
 
 #include <painlessMesh.h>
@@ -43,13 +44,18 @@ void setup() {
     Serial.println("==================================================");
     Serial.printf("ESP8266 Bi-directional Sensor Mesh Node\n");
     Serial.printf("My Node ID: %u -> Target Node ID: %u\n", MY_NODE_ID, TARGET_NODE_ID);
-    Serial.printf("PWM Pin: GPIO %d | Sensor Pin: A0\n", PWM_PIN);
+    Serial.printf("Analog In: A0 | PWM Out: GPIO %d (D1)\n", PWM_PIN);
+    Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
     Serial.println("==================================================");
 
     // Initialize hardware pins
     pinMode(SENSOR_PIN, INPUT);
     pinMode(PWM_PIN, OUTPUT);
     analogWrite(PWM_PIN, 0); // Start PWM at 0% duty cycle
+
+    pinMode(DIGITAL_INPUT_PIN, INPUT_PULLUP);
+    pinMode(DIGITAL_OUTPUT_PIN, OUTPUT);
+    digitalWrite(DIGITAL_OUTPUT_PIN, LOW); // Default digital output state
 
     // Enable painlessMesh debug messages (optional)
     // mesh.setDebugMsgTypes(ERROR | MESH_STATUS | CONNECTION);
@@ -72,11 +78,15 @@ void loop() {
 }
 
 /**
- * Reads A0 analog input, packs into compact binary struct, hex-encodes it, and broadcasts over mesh.
+ * Reads A0 analog input and D2 digital input, packs into compact binary struct,
+ * hex-encodes it, and broadcasts over mesh.
  */
 void sendSensorData() {
     // Read analog pin (0 - 1023)
     uint16_t rawSensorVal = analogRead(SENSOR_PIN);
+
+    // Read digital pin (D2)
+    uint8_t digitalVal = digitalRead(DIGITAL_INPUT_PIN);
 
     // Construct binary payload
     SensorMessage msg;
@@ -84,6 +94,7 @@ void sendSensorData() {
     msg.sender_id = MY_NODE_ID;
     msg.target_id = TARGET_NODE_ID;
     msg.sensor_value = rawSensorVal;
+    msg.digital_value = digitalVal;
     msg.seq = ++messageSequence;
 
     // Hex-encode struct to avoid 0x00 null byte truncation in painlessMesh JSON serialization
@@ -99,8 +110,8 @@ void sendSensorData() {
 
     mesh.sendBroadcast(String(hexBuffer));
 
-    Serial.printf("[TX #%u] Sent Sensor Value: %u (Raw A0) -> Target Node: %u (Struct: %d bytes, Hex Payload: %s)\n",
-                  msg.seq, rawSensorVal, TARGET_NODE_ID, (int)structSize, hexBuffer);
+    Serial.printf("[TX #%u] Analog A0: %u | Digital D2: %u -> Target Node: %u (Struct: %d bytes, Hex Payload: %s)\n",
+                  msg.seq, rawSensorVal, digitalVal, TARGET_NODE_ID, (int)structSize, hexBuffer);
 }
 
 /**
@@ -139,11 +150,15 @@ void receivedCallback(uint32_t from, String &msg) {
             pwmValue = PWM_RANGE;
         }
 
-        // Drive the PWM pin
+        // Drive the PWM pin (D1)
         analogWrite(PWM_PIN, pwmValue);
 
-        Serial.printf("[RX #%u] From Node: %u | Sensor Data: %u -> Set PWM Duty: %u/%d (Mesh NodeID: %u)\n",
-                      incoming.seq, incoming.sender_id, incoming.sensor_value, pwmValue, PWM_RANGE, from);
+        // Drive the digital output pin (D3)
+        uint8_t digitalState = incoming.digital_value ? HIGH : LOW;
+        digitalWrite(DIGITAL_OUTPUT_PIN, digitalState);
+
+        Serial.printf("[RX #%u] From Node: %u | Analog: %u -> PWM Duty: %u/%d | Digital D2 -> D3: %u (Mesh NodeID: %u)\n",
+                      incoming.seq, incoming.sender_id, incoming.sensor_value, pwmValue, PWM_RANGE, digitalState, from);
     } else {
         // Message is relayed automatically by painlessMesh to other nodes
         Serial.printf("[RELAY] From Node: %u to Target Node: %u (relayed via mesh node %u)\n",
