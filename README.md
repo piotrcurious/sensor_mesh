@@ -1,9 +1,9 @@
 # ESP8266 Bi-Directional Sensor & Servo Mesh (DSP Enhanced)
 
-An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring zero-initialized protocol structs, static size assertions, static hex transmission buffers, strict transport route locking (`from == targetMeshNodeId`), targeted unicast handshakes, boot session incarnation tracking (`session_id`), traffic separation (unicast control vs. discovery broadcasts), active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, high-precision Digital Signal Processing (DSP) for analog inputs, sub-microsecond fixed-point resolution, directional limit switch protection, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
+An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring strict rate-limited unicast transmission, adaptive Kalman DSP filtering, boot session incarnation tracking (`session_id`), traffic separation (unicast control vs. discovery broadcasts), active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, sub-microsecond fixed-point resolution, directional limit switch protection, and microsecond-level actuator control. This repository provides two firmware variants:
 
 1. **`esp8266_mesh_pair`**: PWM & Digital IO version (transmits 1/sec periodic updates).
-2. **`esp8266_mesh_servo`**: Servo version (50ms input polling, 200ms network rate limiting, sub-microsecond FP4 fixed-point pulse transmission, directional limit switch safety clamping).
+2. **`esp8266_mesh_servo`**: Servo version (50ms input polling, 200ms strict network rate limiting, sub-microsecond FP4 fixed-point pulse transmission, directional limit switch safety clamping).
 
 Both versions allow creating paired ESP8266 nodes (configured with simple compile-time node IDs) that communicate bi-directionally over an ad-hoc Wi-Fi mesh network using compact hex-encoded binary packed structs.
 
@@ -14,7 +14,8 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 | Feature | `esp8266_mesh_pair` (PWM Version) | `esp8266_mesh_servo` (Servo Version) |
 |---|---|---|
 | **Input Polling Rate** | 1000 ms (1 Hz) | 50 ms (20 Hz local sampling, Wi-Fi PHY safe) |
-| **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Rate-limited (max 1 packet per 200 ms / 5 Hz) |
+| **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Strictly rate-limited (max 1 packet per 200 ms / 5 Hz) |
+| **Rate Limit Enforcement** | Unconditional timer updates on transmission attempts | Unconditional timer updates on transmission attempts |
 | **Protocol Hardening** | Zero-initialized structs, static size assertions, static hex buffers | Zero-initialized structs, static size assertions, static hex buffers |
 | **Route Locking** | Strict route validation (`from == targetMeshNodeId` when connected) | Strict route validation (`from == targetMeshNodeId` when connected) |
 | **Control Traffic Transport** | Strict Targeted Unicast `mesh.sendSingle()` | Strict Targeted Unicast `mesh.sendSingle()` |
@@ -22,7 +23,7 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 | **Handshake Response** | Unicast `HELLO_ACK` (no broadcast fallback) | Unicast `HELLO_ACK` (no broadcast fallback) |
 | **Peer State Machine** | `UNKNOWN`, `DISCOVERING`, `CONNECTED` | `UNKNOWN`, `DISCOVERING`, `CONNECTED` |
 | **Sender Filtering & Sequence** | Paired sender validation (`sender_id == TARGET_NODE_ID`) & wraparound sequence tracking | Paired sender validation (`sender_id == TARGET_NODE_ID`) & wraparound sequence tracking |
-| **Analog Input Processing** | Sort-based Trimmed Mean + Kahan Oversampling + 1D Kalman Filter | Sort-based Trimmed Mean + Kahan Oversampling + 1D Kalman Filter |
+| **Analog Input Processing** | Sort-based Trimmed Mean + Kahan Oversampling + Adaptive 1D Kalman Filter | Sort-based Trimmed Mean + Kahan Oversampling + Adaptive 1D Kalman Filter |
 | **Actuator Drive Resolution**| PWM Output on `D1` (GPIO 5, 0-1023) | Sub-microsecond FP4 Fixed-Point (1/16th $\mu s$) via `writeMicroseconds()` |
 | **Digital IO Pin** | `D2` In $\rightarrow$ `D3` Out | `D2` In $\rightarrow$ `D3` Out |
 | **Limit Switch Support** | N/A | `D6` (Min Limit) & `D7` (Max Limit) |
@@ -31,21 +32,16 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ---
 
-## 2. Protocol Hardening & Traffic Separation
+## 2. Rate Limiting, Adaptive DSP & Safety
 
-### Zero-Initialized Structs & Static Assertions
-- All protocol message structures are explicitly zero-initialized (`Struct{}`) prior to serialization, preventing uninitialized stack garbage in compiler padding bytes from leaking across the network.
-- Static compile-time assertions (`static_assert(sizeof(...) == EXPECTED)`) verify layout size at build time.
+### Rate-Limiting Enforcement (200 ms)
+- Network transmissions are strictly rate-limited using `MIN_TX_INTERVAL_MS` (200 ms / 5 Hz max transmission rate).
+- `lastTxTime` is updated **unconditionally on every transmission attempt**, dropping transient intermediate states during rate-limit windows rather than queueing or deferring them.
+- High-rate 50 ms input polling continues locally, updating local limit switch safety clamping immediately without waiting for network transmission timers.
 
-### Static Hex Buffers (Zero Heap Allocation)
-- Eliminates repeated dynamic string/buffer allocations by reusing pre-allocated static character buffers (`staticHexTxBuffer`) for hex formatting, preserving ESP8266 heap health during long-term operation.
-
-### Strict Transport Route Locking
-- Once `peerState == PeerState::CONNECTED`, data payload frames are accepted **ONLY if `from == targetMeshNodeId`**.
-- Prevents unverified mesh nodes or rogue broadcasts from hijacking active target transport routes.
-
-### Targeted Unicast Handshakes
-- `sendHelloAck()` transmits responses strictly via targeted unicast (`mesh.sendSingle`). Targeted ACKs never fall back to broadcast flooding.
+### Adaptive 1D Kalman Filter
+- Dynamic process noise $Q$ scales automatically with input motion innovation (`fabsf(averageAdc - kalman_x)`).
+- Eliminates motion lag and step response latency during rapid input changes while maintaining heavy noise smoothing when stationary.
 
 ---
 
@@ -90,9 +86,9 @@ arduino-cli upload -p /dev/ttyUSB1 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
 
 ```text
 ==================================================
-ESP8266 Bi-directional Servo Mesh Node (Hardened Protocol)
+ESP8266 Bi-directional Servo Mesh Node (Adaptive DSP & Rate-Limited Unicast)
 My Node ID: 1 (Session: 3849201) -> Target Node ID: 2
-Analog In: A0 (DSP Kahan+Kalman) | Servo Pin: GPIO 5 (D1) [544 - 2400 us]
+Analog In: A0 (Adaptive Kahan+Kalman) | Servo Pin: GPIO 5 (D1) [544 - 2400 us]
 Digital In: GPIO 4 (D2) | Digital Out: GPIO 0 (D3)
 Min Limit Pin: GPIO 12 (D6) | Max Limit Pin: GPIO 13 (D7)
 ==================================================

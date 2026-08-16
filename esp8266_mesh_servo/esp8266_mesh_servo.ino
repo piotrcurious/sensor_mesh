@@ -3,6 +3,10 @@
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Hardening Enhancements:
+  - Network Rate Limiting Bug Fix:
+    * Updates lastTxTime = now unconditionally when a transmission attempt occurs.
+      Prevents 50ms polling loop from retrying transmission on every cycle if sentDirect returns false
+      or during connection transitions.
   - Adaptive 1D Kalman Filter:
     * Dynamic process noise Q scales with motion innovation, eliminating motion lag
       during rapid input changes while maintaining heavy noise smoothing when stationary.
@@ -11,7 +15,6 @@
       for network timers.
     * Network state change checking compares current poll reading directly against LAST TRANSMITTED
       state, dropping intermediate transient states during rate-limit windows rather than deferring them.
-    * Only updates lastTransmitted state tracking upon successful unicast delivery.
   - Protocol Integrity & Zero-Initialization:
     * Zero-initializes all C++ structs (Struct{}) to prevent stack garbage leakage in padding bytes.
     * Static compile-time size assertions (static_assert) guarantee wire format structure size.
@@ -340,6 +343,9 @@ void checkAndTransmitInputs() {
         }
         staticHexTxBuffer[SERVO_WIRE_HEX_LEN] = '\0';
 
+        // Always update lastTxTime so rate-limiting timer (MIN_TX_INTERVAL_MS) is strictly enforced
+        lastTxTime = now;
+
         // Strict Unicast CONTROL Transmission
         bool sentDirect = mesh.sendSingle(targetMeshNodeId, String(staticHexTxBuffer));
 
@@ -348,7 +354,6 @@ void checkAndTransmitInputs() {
             lastDigitalVal = currentDigital;
             lastMinLimit = currentMinLimit;
             lastMaxLimit = currentMaxLimit;
-            lastTxTime = now;
         }
 
         Serial.printf("[TX #%u] Filtered ADC: %.2f | Target Pulse: %.2f us (FP4: %u) | Unicast Sent: %s (Session: %u)\n",
