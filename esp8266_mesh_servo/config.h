@@ -56,8 +56,11 @@
 // Maximum interval between transmissions even if no state changes (heartbeat ms)
 #define HEARTBEAT_INTERVAL_MS 5000
 
-// Poll interval for input change detection and DSP sampling (ms)
-#define POLL_INTERVAL_MS 20
+// High-rate input polling interval (5 ms = 200 Hz sampling)
+#define POLL_INTERVAL_MS 5
+
+// Network rate limit: minimum time between mesh packet broadcasts (200 ms = 5 Hz max packet rate)
+#define MIN_TX_INTERVAL_MS 200
 
 // ============================================================================
 // DSP & Precision Parameters (Oversampling, Kahan, Outlier, Kalman)

@@ -1,9 +1,9 @@
 # ESP8266 Bi-Directional Sensor & Servo Mesh (DSP Enhanced)
 
-An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring high-precision Digital Signal Processing (DSP) for analog inputs and microsecond-level actuator control. This repository provides two firmware variants:
+An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring high-precision Digital Signal Processing (DSP) for analog inputs, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
 
 1. **`esp8266_mesh_pair`**: PWM & Digital IO version (transmits 1/sec periodic updates).
-2. **`esp8266_mesh_servo`**: Servo version (event-driven updates on input changes, microsecond pulse control, limit switch support, and local motion clamping).
+2. **`esp8266_mesh_servo`**: Servo version (5ms high-frequency input polling, 200ms network rate limiting, microsecond pulse control, limit switch support, and local motion clamping).
 
 Both versions allow creating paired ESP8266 nodes (configured with simple compile-time node IDs) that communicate bi-directionally over an ad-hoc Wi-Fi mesh network using compact hex-encoded binary packed structs.
 
@@ -13,7 +13,8 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 | Feature | `esp8266_mesh_pair` (PWM Version) | `esp8266_mesh_servo` (Servo Version) |
 |---|---|---|
-| **Transmission Trigger** | Periodic timer (1/sec = 1000 ms) | Event-driven ($\ge 3\mu s$ pulse change) + 5s heartbeat |
+| **Input Polling Rate** | 1000 ms (1 Hz) | 5 ms (200 Hz high-frequency local sampling) |
+| **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Rate-limited (max 1 packet per 200 ms / 5 Hz) |
 | **Analog Input Processing** | Kahan Oversampling + Outlier Rejection + 1D Kalman Filter | Kahan Oversampling + Outlier Rejection + 1D Kalman Filter |
 | **Primary Actuator / Drive** | PWM Output on `D1` (GPIO 5, 0-1023) | Servo Motor via `writeMicroseconds()` on `D1` (544–2400 $\mu s$) |
 | **Digital IO Pin** | `D2` In $\rightarrow$ `D3` Out | `D2` In $\rightarrow$ `D3` Out |
@@ -23,25 +24,32 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ---
 
-## 2. Advanced DSP Pipeline & Precision Features
+## 2. Advanced DSP Pipeline, High-Frequency Polling & Rate Limiting
 
-To eliminate analog signal noise, ADC jitter, and floating-point accumulation drift:
+To eliminate analog signal noise, ADC jitter, and floating-point accumulation drift while managing network bandwidth:
 
-1. **Kahan Summation Oversampling**:
+1. **High-Frequency Input Polling (5 ms)**:
+   - Polls analog and digital inputs every **5 ms (200 Hz)**, allowing instant local response and immediate local limit switch clamping without waiting for network transmissions.
+
+2. **Network Data Rate Limiting (200 ms)**:
+   - Throttles outgoing mesh network broadcasts to a minimum interval of **200 ms (5 Hz max packet rate)**.
+   - Prevents Wi-Fi packet congestion and channel saturation on the `painlessMesh` network while preserving low-latency control.
+
+3. **Kahan Summation Oversampling**:
    - Takes 16 raw ADC samples per measurement cycle.
    - Accumulates samples using the **Kahan Summation algorithm** to compensate for numerical floating-point precision loss.
 
-2. **Trimmed-Mean Outlier Rejection**:
+4. **Trimmed-Mean Outlier Rejection**:
    - Discards the highest and lowest sampled values from each batch to filter out electrical spikes or contact bounce noise.
 
-3. **1D Kalman Filtering**:
+5. **1D Kalman Filtering**:
    - Passes the averaged oversampled reading through a 1-dimensional Kalman Filter (`Q = 0.05`, `R = 4.0`) to produce ultra-smooth continuous motion control.
 
-4. **Microsecond Resolution Servo Control (`writeMicroseconds`)**:
+6. **Microsecond Resolution Servo Control (`writeMicroseconds`)**:
    - Directly maps high-precision filtered analog readings to target pulse durations in microseconds (`544 µs` to `2400 µs`).
    - Drives servos using `myServo.writeMicroseconds()`, unlocking maximum angular resolution far exceeding whole-degree integer stepping (`write()`).
 
-5. **Compact Packed Binary Structs (Hex Encoded)**:
+7. **Compact Packed Binary Structs (Hex Encoded)**:
    - Data is packed into byte-aligned structs and hex-encoded to guarantee that null bytes (`0x00`) within multi-byte integers do not truncate the string during painlessMesh JSON transport.
 
    **Servo Mesh Struct (`ServoMeshMessage`):**
@@ -98,7 +106,7 @@ To eliminate analog signal noise, ADC jitter, and floating-point accumulation dr
 ├── esp8266_mesh_pair/       # PWM & Digital IO Mesh Firmware (DSP Enhanced)
 │   ├── config.h
 │   └── esp8266_mesh_pair.ino
-├── esp8266_mesh_servo/      # Servo, Microsecond Control & DSP Firmware
+├── esp8266_mesh_servo/      # Servo, 5ms Poll / 200ms Rate Limit & DSP Firmware
 │   ├── config.h
 │   └── esp8266_mesh_servo.ino
 └── README.md
@@ -151,18 +159,14 @@ arduino-cli upload -p /dev/ttyUSB1 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
 
 ## 5. Operation & Diagnostics
 
-1. **High-Precision Servo Motion**:
-   - Turning the potentiometer on Node 1 generates smooth, jitter-free microsecond pulse commands sent immediately across the mesh network.
-   - Node 2 receives the pulse command (e.g. `1472 us`) and drives the servo directly via `myServo.writeMicroseconds(1472)`.
+1. **High-Frequency Input & Rate-Limited Network**:
+   - Inputs are polled every 5 ms. Local limit switch safety clamping takes effect immediately (0 ms delay).
+   - Mesh packet transmissions are rate-limited to at most one broadcast every 200 ms when inputs change.
 
-2. **Limit Switch Motion Clamping**:
-   - If the minimum limit switch (`D6`) is active, local servo pulse width is clamped to `544 us`.
-   - If the maximum limit switch (`D7`) is active, local servo pulse width is clamped to `2400 us`.
-
-3. **Serial Monitor Logs (115200 baud)**:
+2. **Serial Monitor Logs (115200 baud)**:
    ```text
    ==================================================
-   ESP8266 Bi-directional Servo Mesh Node (DSP Enhanced)
+   ESP8266 Bi-directional Servo Mesh Node (5ms Poll / 200ms Rate Limit)
    My Node ID: 1 -> Target Node ID: 2
    Analog In: A0 (DSP Kahan+Kalman) | Servo Pin: GPIO 5 (D1) [544 - 2400 us]
    Digital In: GPIO 4 (D2) | Digital Out: GPIO 0 (D3)

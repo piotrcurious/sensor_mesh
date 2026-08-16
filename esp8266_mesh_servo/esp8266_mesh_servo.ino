@@ -1,14 +1,14 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (High-Precision DSP)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (High-Precision DSP & Rate Limited)
   Uses painlessMesh to create an auto-organizing mesh network.
 
-  DSP & Precision Features:
+  DSP & Rate Limiting Features:
+  - High-frequency input polling (every 5 ms / 200 Hz) for immediate local motion update and limit switch clamping.
+  - Rate-limited network transmissions (minimum 200 ms between mesh packet broadcasts).
   - Analog oversampling with Kahan Summation to eliminate floating point accumulation error.
   - Outlier rejection (trimmed mean discarding highest and lowest ADC samples).
   - 1D Kalman Filter to produce ultra-smooth analog readings.
   - High-precision Servo driving using myServo.writeMicroseconds().
-  - Event-driven transmission when input changes exceed pulse width threshold.
-  - Local limit switch clamping on microsecond servo movement.
 */
 
 #include <painlessMesh.h>
@@ -29,14 +29,14 @@ void nodeTimeAdjustedCallback(int32_t offset);
 void updateLocalServoMicroseconds(uint16_t requestedUs);
 float readAnalogFiltered();
 
-// Polling task (checks for state changes every POLL_INTERVAL_MS)
+// High-rate polling task (5 ms)
 Task taskPollInputs(POLL_INTERVAL_MS, TASK_FOREVER, &checkAndTransmitInputs);
 
 // Kalman Filter State
 static float kalman_x = 512.0f; // Estimated value
 static float kalman_p = 1.0f;    // Estimation error covariance
 
-// State tracking for change detection
+// State tracking for change detection & network rate limiting
 static uint16_t lastTransmittedUs = 0xFFFF;
 static uint8_t  lastDigitalVal = 0xFF;
 static uint8_t  lastMinLimit = 0xFF;
@@ -95,10 +95,7 @@ float readAnalogFiltered() {
     float averageAdc = (validSamplesCount > 0) ? (sum / (float)validSamplesCount) : (float)minVal;
 
     // 3. 1D Kalman Filter Update
-    // Prediction step
     kalman_p = kalman_p + KALMAN_PROCESS_NOISE_Q;
-
-    // Measurement update step
     float k_gain = kalman_p / (kalman_p + KALMAN_MEASUREMENT_NOISE_R);
     kalman_x = kalman_x + k_gain * (averageAdc - kalman_x);
     kalman_p = (1.0f - k_gain) * kalman_p;
@@ -112,7 +109,7 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (DSP Enhanced)\n");
+    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (5ms Poll / 200ms Rate Limit)\n");
     Serial.printf("My Node ID: %u -> Target Node ID: %u\n", MY_NODE_ID, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
                   SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
@@ -130,7 +127,7 @@ void setup() {
     pinMode(MIN_LIMIT_PIN, INPUT_PULLUP);
     pinMode(MAX_LIMIT_PIN, INPUT_PULLUP);
 
-    // Initialize Kalman state with initial reading
+    // Initialize Kalman state
     kalman_x = (float)analogRead(SENSOR_PIN);
 
     // Attach Servo with calibrated pulse width range (544 to 2400 us)
@@ -144,7 +141,7 @@ void setup() {
     mesh.onChangedConnections(&changedConnectionCallback);
     mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback);
 
-    // Add and enable polling task
+    // Add and enable high-rate polling task
     userScheduler.addTask(taskPollInputs);
     taskPollInputs.enable();
 }
@@ -155,7 +152,9 @@ void loop() {
 }
 
 /**
- * Checks all inputs for state changes and transmits if changed or if heartbeat interval elapsed.
+ * Polls inputs at high frequency (5 ms).
+ * Updates local limit switch clamping immediately.
+ * Enforces MIN_TX_INTERVAL_MS (200 ms) rate limiting on mesh broadcast transmissions.
  */
 void checkAndTransmitInputs() {
     // Read high-precision filtered analog value (0.0f - 1023.0f)
@@ -171,7 +170,7 @@ void checkAndTransmitInputs() {
     uint8_t currentMinLimit = (digitalRead(MIN_LIMIT_PIN) == LOW) ? 1 : 0;
     uint8_t currentMaxLimit = (digitalRead(MAX_LIMIT_PIN) == LOW) ? 1 : 0;
 
-    // Check if limit switch state changed locally -> update local servo clamping immediately
+    // Local limit switch reaction (updates local servo immediately every 5ms)
     if (currentMinLimit != lastMinLimit || currentMaxLimit != lastMaxLimit) {
         updateLocalServoMicroseconds(currentTargetUs);
     }
@@ -181,11 +180,14 @@ void checkAndTransmitInputs() {
     bool digitalChanged = (currentDigital != lastDigitalVal);
     bool minLimitChanged = (currentMinLimit != lastMinLimit);
     bool maxLimitChanged = (currentMaxLimit != lastMaxLimit);
+    bool stateChanged = (pulseChanged || digitalChanged || minLimitChanged || maxLimitChanged);
 
     uint32_t now = millis();
-    bool heartbeat = (now - lastTxTime >= HEARTBEAT_INTERVAL_MS);
+    bool rateLimitElapsed = (now - lastTxTime >= MIN_TX_INTERVAL_MS);
+    bool heartbeatElapsed = (now - lastTxTime >= HEARTBEAT_INTERVAL_MS);
 
-    if (pulseChanged || digitalChanged || minLimitChanged || maxLimitChanged || heartbeat) {
+    // Enforce 200 ms network rate limiting
+    if ((stateChanged && rateLimitElapsed) || heartbeatElapsed) {
         // Construct binary payload
         ServoMeshMessage msg;
         msg.magic = MESSAGE_MAGIC;
@@ -210,7 +212,7 @@ void checkAndTransmitInputs() {
 
         mesh.sendBroadcast(String(hexBuffer));
 
-        // Update last state tracking
+        // Update last transmitted state tracking & timestamp
         lastTransmittedUs = currentUs;
         lastDigitalVal = currentDigital;
         lastMinLimit = currentMinLimit;
