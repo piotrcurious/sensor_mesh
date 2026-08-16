@@ -1,6 +1,6 @@
-# ESP8266 Bi-Directional Sensor & Servo Mesh (DSP & LUT Hardened)
+# ESP8266 Bi-Directional Sensor & Servo Mesh (DSP Enhanced)
 
-An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring fast Lookup-Table (LUT) hex encoding/decoding (`bytesToHex` / `hexToBytes`), CRC-16-CCITT checksum verification, handshake-only session installation (`session_id`), zero heap fragmentation, strict rate-limited unicast transmission, adaptive Kalman DSP filtering, traffic separation (unicast control vs. discovery broadcasts), active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, sub-microsecond fixed-point resolution, directional limit switch protection, and microsecond-level actuator control. This repository provides two firmware variants:
+An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring unified `PeerSession` tuple validation, handshake sequence tracking, fast Lookup-Table (LUT) hex encoding/decoding (`bytesToHex` / `hexToBytes`), CRC-16-CCITT checksum verification, handshake-only session installation (`session_id`), zero heap fragmentation, strict rate-limited unicast transmission, adaptive Kalman DSP filtering, traffic separation (unicast control vs. discovery broadcasts), active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, sub-microsecond fixed-point resolution, directional limit switch protection, and microsecond-level actuator control. This repository provides two firmware variants:
 
 1. **`esp8266_mesh_pair`**: PWM & Digital IO version (transmits 1/sec periodic updates).
 2. **`esp8266_mesh_servo`**: Servo version (50ms input polling, 200ms strict network rate limiting, sub-microsecond FP4 fixed-point pulse transmission, directional limit switch safety clamping).
@@ -15,6 +15,8 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 |---|---|---|
 | **Input Polling Rate** | 1000 ms (1 Hz) | 50 ms (20 Hz local sampling, Wi-Fi PHY safe) |
 | **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Rate-limited (max 1 packet per 200 ms / 5 Hz) |
+| **Session Tracking** | Unified `PeerSession` tuple validation + Handshake Sequence Tracking | Unified `PeerSession` tuple validation + Handshake Sequence Tracking |
+| **Duplicate HELLO Handling** | ACK sent; DATA sequence counter (`lastDataSeq`) is NOT reset | ACK sent; DATA sequence counter (`lastDataSeq`) is NOT reset |
 | **Hex Serialization Engine** | Fast local Lookup Table (`HEX_LUT[]`) | Fast local Lookup Table (`HEX_LUT[]`) |
 | **Checksum Verification** | 16-bit CRC-16-CCITT (`crc16`) | 16-bit CRC-16-CCITT (`crc16`) |
 | **Session Incarnation Policy** | Handshake-Only Session Installation (`MSG_TYPE_HELLO` / `HELLO_ACK`) | Handshake-Only Session Installation (`MSG_TYPE_HELLO` / `HELLO_ACK`) |
@@ -34,15 +36,31 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ---
 
-## 2. Fast LUT Hex Encoding & CRC-16 Checksum Hardening
+## 2. Hardened PeerSession Tuple Validation & Protocol Architecture
 
-### Fast LUT Hex Encoder & Decoder (`bytesToHex` / `hexToBytes`)
-- Replaces slow `sprintf` loops with a high-performance local lookup table (`HEX_LUT[] = "0123456789ABCDEF"`).
-- `bytesToHex()` and `hexToBytes()` convert binary structs to ASCII hex characters for safe transportation over painlessMesh JSON payloads with zero dynamic heap allocation.
+### Unified `PeerSession` Tuple State
+Session state tracking uses a complete tuple representation:
+```cpp
+struct PeerSession {
+    uint32_t  meshNodeId;      // Transport painlessMesh node ID
+    uint16_t  senderId;        // Application sender ID (TARGET_NODE_ID)
+    uint32_t  sessionId;       // Active boot session incarnation token
+    uint32_t  lastDataSeq;     // Last accepted DATA sequence number
+    uint32_t  lastHelloSeq;    // Last accepted HELLO handshake sequence number
+    PeerState state;          // UNKNOWN, DISCOVERING, CONNECTED
+    bool      hasDataSeq;      // Sequence initialization flag
+    bool      hasHelloSeq;     // Handshake sequence initialization flag
+};
+```
 
-### CRC-16-CCITT Checksum Verification
+### Handshake-Only Session Installation & Duplicate HELLO Protection
+- Replay/Duplicate HELLO frames from an already active session send a targeted `HELLO_ACK` reply, but **DO NOT reset `lastDataSeq`**.
+- Only authentic new session ID handshakes or newer handshake sequence numbers re-synchronize sequence counters.
+- Stale or old HELLO packets from previous boots are dropped.
+
+### Fast LUT Hex Encoding & CRC-16 Checksum Hardening
+- Replaces `sprintf` with a fast local lookup table (`HEX_LUT[] = "0123456789ABCDEF"`).
 - Every message structure includes a trailing 16-bit `crc16` field computed over all header and payload bytes (`calculateCRC16`).
-- Receivers re-calculate the CRC-16 on incoming frames and reject any packet where the checksum fails.
 
 ---
 
@@ -87,13 +105,13 @@ arduino-cli upload -p /dev/ttyUSB1 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
 
 ```text
 ==================================================
-ESP8266 Bi-directional Servo Mesh Node (Fast LUT & CRC16)
+ESP8266 Bi-directional Servo Mesh Node (PeerSession Tuple Validated)
 My Node ID: 1 (Session: 3849201) -> Target Node ID: 2
 Analog In: A0 (Adaptive Kahan+Kalman) | Servo Pin: GPIO 5 (D1) [544 - 2400 us]
 Digital In: GPIO 4 (D2) | Digital Out: GPIO 0 (D3)
 Min Limit Pin: GPIO 12 (D6) | Max Limit Pin: GPIO 13 (D7)
 ==================================================
-[DISCOVERY #1] Sent HELLO broadcast for Target Node 2 (Session: 3849201, CRC: 0xA3F1)
+[DISCOVERY #1] Sent HELLO broadcast for Target Node 2 (Session: 3849201)
 [HANDSHAKE] Received HELLO_ACK from Target Node 2 (MeshID: 312847102, Session: 9812402). Transitioned to CONNECTED.
 [SESSION] Handshake Established Active Target Session ID: 9812402 (Seq Reset to 0)
 [TX #1] Filtered ADC: 512.35 | Target Pulse: 1472.25 us (FP4: 23556) | Unicast Queued: SUCCESS (CRC: 0xB4E2)

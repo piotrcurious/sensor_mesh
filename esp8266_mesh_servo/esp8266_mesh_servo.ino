@@ -1,22 +1,22 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Fast LUT Hex & CRC16 Hardened)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Hardened PeerSession Tuple Validation)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Hardening Enhancements:
-  - Fast Local Lookup Table (LUT) Hex Encoder / Decoder:
-    * Replaces slow sprintf formatting with a ultra-fast local lookup table (HEX_LUT[]) encoder (bytesToHex).
-    * Fast, robust nibble decoder (hexToBytes).
-  - CRC-16-CCITT Checksum Verification:
-    * Calculates 16-bit CRC-16 over all header and payload bytes prior to transmission.
-    * Receivers recompute and verify the CRC-16 checksum, dropping corrupted packets immediately.
-  - Strict Handshake-Only Session Installation:
-    * DATA packets are NEVER permitted to establish or reset a session.
-  - Zero Heap Allocation Strategy:
-    * Uses a static reusable String txPayloadString with pre-reserved capacity (reserve()).
-  - Adaptive 1D Kalman Filter:
-    * Dynamic process noise Q scales with motion innovation, eliminating motion lag.
-  - Strict Rate Limiting Gate:
-    * Enforces a hard time gate (now - lastTxTime < MIN_TX_INTERVAL_MS).
+  - PeerSession Tuple Validation:
+    * Replaces scalar variables with a unified PeerSession state structure:
+      (meshNodeId, senderId, sessionId, lastDataSeq, lastHelloSeq, state).
+  - Handshake Non-Reset Protection:
+    * Duplicate HELLO / HELLO_ACK frames within the same session DO NOT reset lastDataSeq.
+    * Only authentic new session handshakes or newer HELLO sequences re-synchronize session parameters.
+    * Rejects stale/old HELLO packets from previous boots.
+  - Strict DATA Frame Validation:
+    * DATA frames are validated against the complete PeerSession tuple.
+    * DATA packets with invalid session_id, unverified transport node ID, or stale seq are DROPPED.
+  - Fast Local Lookup Table (LUT) Hex Encoder / Decoder & CRC-16 Checksum.
+  - Zero Heap Allocation Strategy (static reserved txPayloadString).
+  - Sub-microsecond Fixed-Point Precision (FP4 = 1/16th us resolution).
+  - Directional limit switch safety clamping.
 */
 
 #include <painlessMesh.h>
@@ -37,7 +37,7 @@ void changedConnectionCallback();
 void nodeTimeAdjustedCallback(int32_t offset);
 void updateLocalServoFp4(uint16_t requestedUsFp4);
 float readAnalogFiltered();
-bool isNewerSequence(uint32_t incoming, uint32_t last);
+bool isNewerSequence(uint32_t incoming, uint32_t last, bool initialized);
 
 // Fast Hex LUT
 static const char HEX_LUT[] = "0123456789ABCDEF";
@@ -51,10 +51,19 @@ Task taskDiscovery(DISCOVERY_INTERVAL_MS, TASK_FOREVER, &sendHelloDiscovery);
 // Local Boot Session Incarnation ID
 static uint32_t mySessionId = 0;
 
-// Peer Discovery State Machine & Remote Session Tracking
-static PeerState peerState = PeerState::UNKNOWN;
-static uint32_t targetMeshNodeId = 0; // Discovered painlessMesh uint32_t node ID for TARGET_NODE_ID
-static uint32_t targetSessionId = 0;  // Active boot session ID of TARGET_NODE_ID installed via handshake
+// Unified PeerSession State Structure
+struct PeerSession {
+    uint32_t  meshNodeId;      // Transport painlessMesh uint32_t node ID
+    uint16_t  senderId;        // Application sender ID (TARGET_NODE_ID)
+    uint32_t  sessionId;       // Active boot session incarnation token
+    uint32_t  lastDataSeq;     // Last accepted DATA sequence number
+    uint32_t  lastHelloSeq;    // Last accepted HELLO handshake sequence number
+    PeerState state;          // UNKNOWN, DISCOVERING, CONNECTED
+    bool      hasDataSeq;      // Sequence initialization flag
+    bool      hasHelloSeq;     // Handshake sequence initialization flag
+};
+
+static PeerSession peerSession{};
 
 // Kalman Filter State
 static float kalman_x = 512.0f;
@@ -68,10 +77,6 @@ static uint8_t  lastMaxLimit = 0xFF;
 static uint32_t lastTxTime = 0;
 static uint32_t messageSequence = 0;
 static uint32_t discoverySequence = 0;
-
-// Sequence verification
-static uint32_t lastReceivedSeq = 0;
-static bool     hasReceivedFirstPacket = false;
 
 // Motion control state separation in fixed-point 1/16th microseconds (FP4)
 static uint16_t requestedServoUsFp4 = 23552; // 1472 us * 16
@@ -143,21 +148,11 @@ bool hexToBytes(const String& hexStr, uint8_t* dest, size_t destLen) {
 /**
  * Wraparound-safe 32-bit sequence comparison.
  */
-bool isNewerSequence(uint32_t incoming, uint32_t last) {
-    if (!hasReceivedFirstPacket) {
+bool isNewerSequence(uint32_t incoming, uint32_t last, bool initialized) {
+    if (!initialized) {
         return true;
     }
     return ((int32_t)(incoming - last)) > 0;
-}
-
-/**
- * Resets target sequence state EXCLUSIVELY upon authentic handshake session establishment.
- */
-static void resetSessionSequence(uint32_t newSessionId) {
-    targetSessionId = newSessionId;
-    lastReceivedSeq = 0;
-    hasReceivedFirstPacket = false;
-    Serial.printf("[SESSION] Handshake Established Active Target Session ID: %u (Seq Reset to 0)\n", newSessionId);
 }
 
 /**
@@ -220,9 +215,19 @@ void setup() {
     // Pre-reserve static txPayloadString capacity to prevent heap allocations
     txPayloadString.reserve(SERVO_WIRE_HEX_LEN + 1);
 
+    // Initialize peerSession state
+    peerSession.senderId = TARGET_NODE_ID;
+    peerSession.meshNodeId = 0;
+    peerSession.sessionId = 0;
+    peerSession.lastDataSeq = 0;
+    peerSession.lastHelloSeq = 0;
+    peerSession.state = PeerState::DISCOVERING;
+    peerSession.hasDataSeq = false;
+    peerSession.hasHelloSeq = false;
+
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Fast LUT & CRC16)\n");
+    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (PeerSession Tuple Validated)\n");
     Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (Adaptive Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
                   SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
@@ -253,9 +258,6 @@ void setup() {
     mesh.onChangedConnections(&changedConnectionCallback);
     mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback);
 
-    // Start in DISCOVERING state
-    peerState = PeerState::DISCOVERING;
-
     // Enable Tasks
     userScheduler.addTask(taskPollInputs);
     taskPollInputs.enable();
@@ -272,7 +274,7 @@ void loop() {
  * Periodically broadcasts HELLO handshake packets ONLY when state is DISCOVERING / UNKNOWN.
  */
 void sendHelloDiscovery() {
-    if (peerState == PeerState::CONNECTED) {
+    if (peerSession.state == PeerState::CONNECTED) {
         return;
     }
 
@@ -283,7 +285,6 @@ void sendHelloDiscovery() {
     helloMsg.session_id = mySessionId;
     helloMsg.seq = ++discoverySequence;
 
-    // Calculate CRC16 excluding crc16 field
     helloMsg.crc16 = calculateCRC16((const uint8_t*)&helloMsg, sizeof(HandshakeMessage) - sizeof(uint16_t));
 
     bytesToHex((const uint8_t*)&helloMsg, sizeof(HandshakeMessage), staticHexTxBuffer);
@@ -291,8 +292,8 @@ void sendHelloDiscovery() {
     txPayloadString = staticHexTxBuffer;
     mesh.sendBroadcast(txPayloadString);
 
-    Serial.printf("[DISCOVERY #%u] Sent HELLO broadcast for Target Node %u (Session: %u, CRC: 0x%04X)\n",
-                  helloMsg.seq, TARGET_NODE_ID, mySessionId, helloMsg.crc16);
+    Serial.printf("[DISCOVERY #%u] Sent HELLO broadcast for Target Node %u (Session: %u)\n",
+                  helloMsg.seq, TARGET_NODE_ID, mySessionId);
 }
 
 /**
@@ -306,7 +307,6 @@ void sendHelloAck(uint32_t destMeshId) {
     ackMsg.session_id = mySessionId;
     ackMsg.seq = ++discoverySequence;
 
-    // Calculate CRC16 excluding crc16 field
     ackMsg.crc16 = calculateCRC16((const uint8_t*)&ackMsg, sizeof(HandshakeMessage) - sizeof(uint16_t));
 
     bytesToHex((const uint8_t*)&ackMsg, sizeof(HandshakeMessage), staticHexTxBuffer);
@@ -314,8 +314,8 @@ void sendHelloAck(uint32_t destMeshId) {
     txPayloadString = staticHexTxBuffer;
     mesh.sendSingle(destMeshId, txPayloadString);
 
-    Serial.printf("[DISCOVERY #%u] Sent targeted HELLO_ACK to Target Node %u (MeshID: %u, Session: %u, CRC: 0x%04X)\n",
-                  ackMsg.seq, TARGET_NODE_ID, destMeshId, mySessionId, ackMsg.crc16);
+    Serial.printf("[DISCOVERY #%u] Sent targeted HELLO_ACK to Target Node %u (MeshID: %u, Session: %u)\n",
+                  ackMsg.seq, TARGET_NODE_ID, destMeshId, mySessionId);
 }
 
 /**
@@ -347,14 +347,14 @@ void checkAndTransmitInputs() {
     }
 
     // Suppress CONTROL packet transmission unless CONNECTED to target node
-    if (peerState != PeerState::CONNECTED || targetMeshNodeId == 0 || !mesh.isConnected(targetMeshNodeId)) {
-        return; // Suppress control traffic when disconnected
+    if (peerSession.state != PeerState::CONNECTED || peerSession.meshNodeId == 0 || !mesh.isConnected(peerSession.meshNodeId)) {
+        return;
     }
 
-    // STRICT NETWORK RATE-LIMITING GATE:
+    // STRICT NETWORK RATE-LIMITING GATE
     uint32_t now = millis();
     if (lastTxTime != 0 && (now - lastTxTime < MIN_TX_INTERVAL_MS)) {
-        return; // Rate limit gate enforced
+        return;
     }
 
     bool pulseChanged = (abs((int)currentUsFp4 - (int)lastTransmittedUsFp4) >= PULSE_FP4_CHANGE_THRESHOLD);
@@ -377,7 +377,6 @@ void checkAndTransmitInputs() {
         msg.max_limit_active = currentMaxLimit;
         msg.seq = ++messageSequence;
 
-        // Calculate CRC16
         msg.crc16 = calculateCRC16((const uint8_t*)&msg, sizeof(ServoMeshMessage) - sizeof(uint16_t));
 
         bytesToHex((const uint8_t*)&msg, sizeof(ServoMeshMessage), staticHexTxBuffer);
@@ -386,7 +385,7 @@ void checkAndTransmitInputs() {
         txPayloadString = staticHexTxBuffer;
 
         // Strict Unicast CONTROL Transmission
-        bool sentDirect = mesh.sendSingle(targetMeshNodeId, txPayloadString);
+        bool sentDirect = mesh.sendSingle(peerSession.meshNodeId, txPayloadString);
 
         if (sentDirect) {
             lastTransmittedUsFp4 = currentUsFp4;
@@ -436,10 +435,10 @@ void updateLocalServoFp4(uint16_t newRequestedUsFp4) {
 
 /**
  * Callback when a mesh message is received.
- * Strict Session Integrity, CRC-16 Checksum Validation, and Route Validation.
+ * Strict Session Tuple Validation & Duplicate HELLO Sequence Protection.
  */
 void receivedCallback(uint32_t from, String &msg) {
-    // 1. Check for Handshake Messages (HELLO / HELLO_ACK)
+    // 1. Check for Handshake Messages (HELLO / HELLO_ACK) - EXCLUSIVE session installation mechanism
     if (msg.length() == HANDSHAKE_WIRE_HEX_LEN) {
         HandshakeMessage handshake{};
         if (!hexToBytes(msg, (uint8_t*)&handshake, sizeof(HandshakeMessage))) {
@@ -455,19 +454,48 @@ void receivedCallback(uint32_t from, String &msg) {
         }
 
         if (handshake.sender_id == TARGET_NODE_ID && handshake.target_id == MY_NODE_ID) {
+            bool isNewSession = (handshake.session_id != peerSession.sessionId);
+            bool isNewHelloSeq = isNewerSequence(handshake.seq, peerSession.lastHelloSeq, peerSession.hasHelloSeq);
+
             if (handshake.magic == MSG_TYPE_HELLO) {
-                targetMeshNodeId = from;
-                peerState = PeerState::CONNECTED;
-                resetSessionSequence(handshake.session_id);
-                Serial.printf("[HANDSHAKE] Received HELLO from Target Node %u (MeshID: %u, Session: %u). Transitioned to CONNECTED.\n",
-                              TARGET_NODE_ID, from, handshake.session_id);
-                sendHelloAck(from);
+                if (isNewSession || isNewHelloSeq) {
+                    peerSession.meshNodeId = from;
+                    peerSession.sessionId = handshake.session_id;
+                    peerSession.lastHelloSeq = handshake.seq;
+                    peerSession.hasHelloSeq = true;
+                    peerSession.state = PeerState::CONNECTED;
+
+                    if (isNewSession) {
+                        peerSession.lastDataSeq = 0;
+                        peerSession.hasDataSeq = false;
+                        Serial.printf("[HANDSHAKE] NEW Session ID %u established from Node %u (MeshID: %u). Data Seq reset.\n",
+                                      handshake.session_id, TARGET_NODE_ID, from);
+                    } else {
+                        Serial.printf("[HANDSHAKE] Valid HELLO from existing Session ID %u (MeshID: %u, HelloSeq: %u).\n",
+                                      handshake.session_id, from, handshake.seq);
+                    }
+                    sendHelloAck(from);
+                } else {
+                    // Duplicate/Old HELLO inside current session -> reply ACK but DO NOT reset DATA sequence!
+                    Serial.printf("[HANDSHAKE] Duplicate HELLO (Session: %u, HelloSeq: %u). Sending ACK without DATA seq reset.\n",
+                                  handshake.session_id, handshake.seq);
+                    sendHelloAck(from);
+                }
             } else if (handshake.magic == MSG_TYPE_HELLO_ACK) {
-                targetMeshNodeId = from;
-                peerState = PeerState::CONNECTED;
-                resetSessionSequence(handshake.session_id);
-                Serial.printf("[HANDSHAKE] Received HELLO_ACK from Target Node %u (MeshID: %u, Session: %u). Transitioned to CONNECTED.\n",
-                              TARGET_NODE_ID, from, handshake.session_id);
+                if (isNewSession || isNewHelloSeq) {
+                    peerSession.meshNodeId = from;
+                    peerSession.sessionId = handshake.session_id;
+                    peerSession.lastHelloSeq = handshake.seq;
+                    peerSession.hasHelloSeq = true;
+                    peerSession.state = PeerState::CONNECTED;
+
+                    if (isNewSession) {
+                        peerSession.lastDataSeq = 0;
+                        peerSession.hasDataSeq = false;
+                        Serial.printf("[HANDSHAKE] NEW Session ID %u ACKed from Node %u (MeshID: %u). Data Seq reset.\n",
+                                      handshake.session_id, TARGET_NODE_ID, from);
+                    }
+                }
             }
         }
         return;
@@ -478,13 +506,15 @@ void receivedCallback(uint32_t from, String &msg) {
         return;
     }
 
-    if (peerState != PeerState::CONNECTED) {
+    // TUPLE VALIDATION RULE 1: Must be in CONNECTED state
+    if (peerSession.state != PeerState::CONNECTED) {
         return;
     }
 
-    if (from != targetMeshNodeId) {
+    // TUPLE VALIDATION RULE 2: Must originate from active peerSession.meshNodeId
+    if (from != peerSession.meshNodeId) {
         Serial.printf("[RX REJECT] DATA payload from unverified MeshID %u (Active Target MeshID: %u)\n",
-                      from, targetMeshNodeId);
+                      from, peerSession.meshNodeId);
         return;
     }
 
@@ -505,26 +535,33 @@ void receivedCallback(uint32_t from, String &msg) {
         return;
     }
 
+    // TUPLE VALIDATION RULE 3: Explicit Sender & Target Validation
     if (incoming.sender_id != TARGET_NODE_ID || incoming.target_id != MY_NODE_ID) {
         return;
     }
 
-    if (incoming.session_id != targetSessionId) {
+    // TUPLE VALIDATION RULE 4: Strict Active Session ID Matching
+    // DATA payloads CANNOT establish or reset sessions. Stale or unauthenticated session IDs are DROPPED.
+    if (incoming.session_id != peerSession.sessionId) {
         Serial.printf("[RX SESSION REJECT] Dropped DATA with stale/unmatched Session ID %u (Active Session: %u)\n",
-                      incoming.session_id, targetSessionId);
+                      incoming.session_id, peerSession.sessionId);
         return;
     }
 
-    if (!isNewerSequence(incoming.seq, lastReceivedSeq)) {
-        Serial.printf("[RX DROP #%u] Out-of-order or duplicate packet dropped (Last Seq: %u, Sender Session: %u)\n",
-                      incoming.seq, lastReceivedSeq, incoming.session_id);
+    // TUPLE VALIDATION RULE 5: Sequence Check for active session
+    if (!isNewerSequence(incoming.seq, peerSession.lastDataSeq, peerSession.hasDataSeq)) {
+        Serial.printf("[RX DROP #%u] Out-of-order or duplicate DATA packet dropped (Last Seq: %u, Session: %u)\n",
+                      incoming.seq, peerSession.lastDataSeq, incoming.session_id);
         return;
     }
 
-    lastReceivedSeq = incoming.seq;
-    hasReceivedFirstPacket = true;
+    peerSession.lastDataSeq = incoming.seq;
+    peerSession.hasDataSeq = true;
 
+    // Update local digital output (D3)
     digitalWrite(DIGITAL_OUTPUT_PIN, incoming.digital_value ? HIGH : LOW);
+
+    // Update local servo
     updateLocalServoFp4(incoming.target_us_fp4);
 
     Serial.printf("[RX #%u] From Node: %u (Session: %u) | Target Pulse: %.2f us (%u FP4) | Digital: %u | MinLim: %u | MaxLim: %u\n",
@@ -536,15 +573,19 @@ void newConnectionCallback(uint32_t nodeId) {
     Serial.printf("[MESH] New Connection, nodeId = %u (Local Mesh Node ID = %u)\n", nodeId, mesh.getNodeId());
 }
 
+/**
+ * Handles topology changes: verifies if peerSession.meshNodeId is still present in current node list.
+ * If disconnected, resets peerSession.meshNodeId and transitions peerSession.state to DISCOVERING.
+ */
 void changedConnectionCallback() {
     Serial.printf("[MESH] Topology changed (Local Mesh Node ID = %u)\n", mesh.getNodeId());
 
-    if (targetMeshNodeId != 0) {
+    if (peerSession.meshNodeId != 0) {
         SimpleList<uint32_t> nodes = mesh.getNodeList();
         bool stillConnected = false;
         SimpleList<uint32_t>::iterator node = nodes.begin();
         while (node != nodes.end()) {
-            if (*node == targetMeshNodeId) {
+            if (*node == peerSession.meshNodeId) {
                 stillConnected = true;
                 break;
             }
@@ -552,10 +593,11 @@ void changedConnectionCallback() {
         }
 
         if (!stillConnected) {
-            Serial.printf("[MESH] Target MeshID %u disconnected. Clearing peer state to DISCOVERING.\n", targetMeshNodeId);
-            targetMeshNodeId = 0;
-            peerState = PeerState::DISCOVERING;
-            hasReceivedFirstPacket = false;
+            Serial.printf("[MESH] Target MeshID %u disconnected. Clearing peer state to DISCOVERING.\n", peerSession.meshNodeId);
+            peerSession.meshNodeId = 0;
+            peerSession.state = PeerState::DISCOVERING;
+            peerSession.hasDataSeq = false;
+            peerSession.hasHelloSeq = false;
         }
     }
 }
