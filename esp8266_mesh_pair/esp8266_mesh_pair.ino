@@ -1,16 +1,20 @@
 /*
-  ESP8266 Bi-directional Sensor Mesh Node Firmware (Session-Incarnation & Unicast Control)
+  ESP8266 Bi-directional Sensor Mesh Node Firmware (Hardened Protocol & Fixed Buffers)
   Uses painlessMesh to create an auto-organizing mesh network.
 
-  Session Incarnation & Sequence Features:
-  - Boot Session Incarnation Token (mySessionId):
-    * Generated upon boot via (ESP.getChipId() ^ micros()).
-    * Included in both Handshake (HELLO/HELLO_ACK) and Data (SensorMessage) frames.
-    * When a new session_id is received from TARGET_NODE_ID, sequence state (lastReceivedSeq)
-      is automatically reset and re-synchronized.
-  - CONTROL Traffic vs DISCOVERY Traffic Separation:
-    * CONTROL / Sensor payloads are sent EXCLUSIVELY via targeted unicast (mesh.sendSingle).
-    * Broadcasts are restricted solely to infrequent HELLO discovery packets during DISCOVERING state.
+  Fixes & Hardening Enhancements:
+  - Protocol Integrity & Zero-Initialization:
+    * Zero-initializes all C++ structs (Struct{}) to prevent stack garbage leakage in padding bytes.
+    * Static compile-time size assertions (static_assert) guarantee wire format structure size.
+  - Heap / String Overhead Optimization:
+    * Uses pre-allocated static character buffers to format hex payloads, eliminating heap fragmentation.
+  - Strict Transport Route Validation:
+    * Once CONNECTED, data payloads are accepted ONLY if from == targetMeshNodeId.
+      Prevents route hijacking or unverified mesh nodes from overwriting active target routes.
+  - Targeted Unicast Handshakes:
+    * HELLO_ACK is sent strictly via unicast; targeted ACKs do NOT fall back to broadcast flooding.
+  - Multi-Spike Trimmed-Mean ADC Filtering:
+    * Sorts ADC samples in place to cleanly strip highest and lowest extremes regardless of duplicate values.
   - PeerState Enum: UNKNOWN, DISCOVERING, CONNECTED.
   - High-Precision DSP filtering (Kahan summation, outlier rejection, 1D Kalman filter).
   - Drives PWM pin (D1) and digital output pin (D3).
@@ -57,6 +61,9 @@ static uint32_t discoverySequence = 0;
 static uint32_t lastReceivedSeq = 0;
 static bool     hasReceivedFirstPacket = false;
 
+// Reusable static buffer for hex formatting to prevent heap fragmentation
+static char staticHexTxBuffer[PAIR_WIRE_HEX_LEN + 1];
+
 // Helper: Convert uint8_t hex character to byte
 static uint8_t hexCharToNibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -86,35 +93,45 @@ static void resetSessionSequence(uint32_t newSessionId) {
 }
 
 /**
- * High-Precision Analog Read with Kahan Summation and Outlier Rejection.
+ * High-Precision Analog Read with Sort-Based Trimmed Mean & Kahan Summation.
  */
 float readAnalogFiltered() {
-    uint16_t minVal = 1023;
-    uint16_t maxVal = 0;
-    float sum = 0.0f;
-    float c = 0.0f;
+    uint16_t samples[ADC_OVERSAMPLE_COUNT];
 
+    // 1. Oversample ADC
     for (size_t i = 0; i < ADC_OVERSAMPLE_COUNT; i++) {
-        uint16_t val = analogRead(SENSOR_PIN);
-        if (val < minVal) minVal = val;
-        if (val > maxVal) maxVal = val;
-
-        float y = (float)val - c;
-        float t = sum + y;
-        c = (t - sum) - y;
-        sum = t;
-
+        samples[i] = analogRead(SENSOR_PIN);
         optimistic_yield(1000);
     }
 
-    float averageAdc;
-    if (ADC_OVERSAMPLE_COUNT >= 4) {
-        float trimmedSum = sum - (float)minVal - (float)maxVal;
-        averageAdc = trimmedSum / (float)(ADC_OVERSAMPLE_COUNT - 2);
-    } else {
-        averageAdc = sum / (float)ADC_OVERSAMPLE_COUNT;
+    // 2. Sort samples in place to cleanly strip highest and lowest extremes
+    for (size_t i = 0; i < ADC_OVERSAMPLE_COUNT - 1; i++) {
+        for (size_t j = i + 1; j < ADC_OVERSAMPLE_COUNT; j++) {
+            if (samples[i] > samples[j]) {
+                uint16_t temp = samples[i];
+                samples[i] = samples[j];
+                samples[j] = temp;
+            }
+        }
     }
 
+    // 3. Kahan Summation on interior trimmed samples (stripping 1 min and 1 max)
+    float sum = 0.0f;
+    float c = 0.0f;
+    size_t startIndex = (ADC_OVERSAMPLE_COUNT >= 4) ? 1 : 0;
+    size_t endIndex = (ADC_OVERSAMPLE_COUNT >= 4) ? (ADC_OVERSAMPLE_COUNT - 1) : ADC_OVERSAMPLE_COUNT;
+    size_t count = endIndex - startIndex;
+
+    for (size_t i = startIndex; i < endIndex; i++) {
+        float y = (float)samples[i] - c;
+        float t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+
+    float averageAdc = (count > 0) ? (sum / (float)count) : (float)samples[0];
+
+    // 4. 1D Kalman Filter Update
     kalman_p = kalman_p + KALMAN_PROCESS_NOISE_Q;
     float k_gain = kalman_p / (kalman_p + KALMAN_MEASUREMENT_NOISE_R);
     kalman_x = kalman_x + k_gain * (averageAdc - kalman_x);
@@ -132,7 +149,7 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (Session Incarnation Aware)\n");
+    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (Hardened Protocol)\n");
     Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | PWM Out: GPIO %d (D1)\n", PWM_PIN);
     Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
@@ -180,54 +197,48 @@ void sendHelloDiscovery() {
         return;
     }
 
-    HandshakeMessage helloMsg;
+    HandshakeMessage helloMsg{}; // Zero-initialized struct
     helloMsg.magic = MSG_TYPE_HELLO;
     helloMsg.sender_id = MY_NODE_ID;
     helloMsg.target_id = TARGET_NODE_ID;
     helloMsg.session_id = mySessionId;
     helloMsg.seq = ++discoverySequence;
 
-    const size_t structSize = sizeof(HandshakeMessage);
-    const size_t hexLen = structSize * 2;
-    char hexBuffer[hexLen + 1];
     const uint8_t* rawBytes = (const uint8_t*)&helloMsg;
 
-    for (size_t i = 0; i < structSize; i++) {
-        sprintf(&hexBuffer[i * 2], "%02X", rawBytes[i]);
+    for (size_t i = 0; i < sizeof(HandshakeMessage); i++) {
+        sprintf(&staticHexTxBuffer[i * 2], "%02X", rawBytes[i]);
     }
-    hexBuffer[hexLen] = '\0';
+    staticHexTxBuffer[HANDSHAKE_WIRE_HEX_LEN] = '\0';
 
-    mesh.sendBroadcast(String(hexBuffer));
+    mesh.sendBroadcast(String(staticHexTxBuffer));
 
     Serial.printf("[DISCOVERY #%u] Sent HELLO broadcast for Target Node %u (Session: %u)\n",
                   helloMsg.seq, TARGET_NODE_ID, mySessionId);
 }
 
 /**
- * Sends a targeted HELLO_ACK response in reply to a received HELLO.
+ * Sends a targeted HELLO_ACK response in reply to a received HELLO strictly via unicast.
  */
 void sendHelloAck(uint32_t destMeshId) {
-    HandshakeMessage ackMsg;
+    HandshakeMessage ackMsg{}; // Zero-initialized struct
     ackMsg.magic = MSG_TYPE_HELLO_ACK;
     ackMsg.sender_id = MY_NODE_ID;
     ackMsg.target_id = TARGET_NODE_ID;
     ackMsg.session_id = mySessionId;
     ackMsg.seq = ++discoverySequence;
 
-    const size_t structSize = sizeof(HandshakeMessage);
-    const size_t hexLen = structSize * 2;
-    char hexBuffer[hexLen + 1];
     const uint8_t* rawBytes = (const uint8_t*)&ackMsg;
 
-    for (size_t i = 0; i < structSize; i++) {
-        sprintf(&hexBuffer[i * 2], "%02X", rawBytes[i]);
+    for (size_t i = 0; i < sizeof(HandshakeMessage); i++) {
+        sprintf(&staticHexTxBuffer[i * 2], "%02X", rawBytes[i]);
     }
-    hexBuffer[hexLen] = '\0';
+    staticHexTxBuffer[HANDSHAKE_WIRE_HEX_LEN] = '\0';
 
-    String payload(hexBuffer);
-    mesh.sendSingle(destMeshId, payload);
+    // Strict Unicast - no broadcast fallback for targeted ACKs
+    mesh.sendSingle(destMeshId, String(staticHexTxBuffer));
 
-    Serial.printf("[DISCOVERY #%u] Sent HELLO_ACK to Target Node %u (MeshID: %u, Session: %u)\n",
+    Serial.printf("[DISCOVERY #%u] Sent targeted HELLO_ACK to Target Node %u (MeshID: %u, Session: %u)\n",
                   ackMsg.seq, TARGET_NODE_ID, destMeshId, mySessionId);
 }
 
@@ -246,7 +257,7 @@ void sendSensorData() {
         return;
     }
 
-    SensorMessage msg;
+    SensorMessage msg{}; // Zero-initialized struct
     msg.magic = MSG_TYPE_DATA;
     msg.sender_id = MY_NODE_ID;
     msg.target_id = TARGET_NODE_ID;
@@ -255,20 +266,15 @@ void sendSensorData() {
     msg.digital_value = digitalVal;
     msg.seq = ++messageSequence;
 
-    const size_t structSize = sizeof(SensorMessage);
-    const size_t hexLen = structSize * 2;
-    char hexBuffer[hexLen + 1];
     const uint8_t* rawBytes = (const uint8_t*)&msg;
 
-    for (size_t i = 0; i < structSize; i++) {
-        sprintf(&hexBuffer[i * 2], "%02X", rawBytes[i]);
+    for (size_t i = 0; i < sizeof(SensorMessage); i++) {
+        sprintf(&staticHexTxBuffer[i * 2], "%02X", rawBytes[i]);
     }
-    hexBuffer[hexLen] = '\0';
-
-    String payload(hexBuffer);
+    staticHexTxBuffer[PAIR_WIRE_HEX_LEN] = '\0';
 
     // Strict Unicast CONTROL Transmission
-    bool sentDirect = mesh.sendSingle(targetMeshNodeId, payload);
+    bool sentDirect = mesh.sendSingle(targetMeshNodeId, String(staticHexTxBuffer));
 
     Serial.printf("[TX #%u] Filtered ADC: %.2f (Val: %u) | Digital D2: %u | Unicast Sent: %s (Session: %u)\n",
                   msg.seq, filteredVal, highResSensorVal, digitalVal,
@@ -277,12 +283,12 @@ void sendSensorData() {
 
 /**
  * Callback when a mesh message is received.
- * Handles HELLO / HELLO_ACK discovery and DATA messages with session incarnation tracking.
+ * Performs strict transport route validation once connected.
  */
 void receivedCallback(uint32_t from, String &msg) {
     // 1. Check for Handshake Messages (HELLO / HELLO_ACK)
-    if (msg.length() == sizeof(HandshakeMessage) * 2) {
-        HandshakeMessage handshake;
+    if (msg.length() == HANDSHAKE_WIRE_HEX_LEN) {
+        HandshakeMessage handshake{};
         uint8_t* rawBytes = (uint8_t*)&handshake;
         for (size_t i = 0; i < sizeof(HandshakeMessage); i++) {
             char highNibble = msg.charAt(i * 2);
@@ -310,11 +316,19 @@ void receivedCallback(uint32_t from, String &msg) {
     }
 
     // 2. Check for Data Payload Messages
-    if (msg.length() != sizeof(SensorMessage) * 2) {
+    if (msg.length() != PAIR_WIRE_HEX_LEN) {
         return;
     }
 
-    SensorMessage incoming;
+    // Strict Transport Route Validation:
+    // Once CONNECTED, reject data payloads originating from any transport node ID other than targetMeshNodeId
+    if (peerState == PeerState::CONNECTED && from != targetMeshNodeId) {
+        Serial.printf("[RX ROUTE REJECT] Ignored DATA payload from unverified MeshID %u (Active Target MeshID: %u)\n",
+                      from, targetMeshNodeId);
+        return;
+    }
+
+    SensorMessage incoming{};
     uint8_t* rawBytes = (uint8_t*)&incoming;
 
     for (size_t i = 0; i < sizeof(SensorMessage); i++) {

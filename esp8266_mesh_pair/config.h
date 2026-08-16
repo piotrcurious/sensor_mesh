@@ -56,7 +56,7 @@
 #define MSG_TYPE_HELLO_ACK  0xE4
 
 // Oversampling count per sample cycle
-#define ADC_OVERSAMPLE_COUNT 4
+#define ADC_OVERSAMPLE_COUNT 8
 
 // Kalman Filter Tuning Parameters
 #define KALMAN_PROCESS_NOISE_Q 0.05f
@@ -66,25 +66,32 @@
 // Compact Binary Struct Definitions (Includes Session Incarnation ID)
 // ============================================================================
 
-// Data Payload Struct
+// Data Payload Struct (16 bytes: 1+2+2+4+2+1+4 = 16 bytes packed)
 struct __attribute__((__packed__)) SensorMessage {
-    uint8_t  magic;          // Magic header byte (MSG_TYPE_DATA = 0xA7)
-    uint16_t sender_id;      // Custom compile-time sender node ID
-    uint16_t target_id;      // Custom compile-time target node ID
-    uint32_t session_id;     // Sender reboot/boot session incarnation token
-    uint16_t sensor_value;   // High-precision analog sensor value (0-1023)
-    uint8_t  digital_value;  // Digital input state (0 or 1 from D2)
-    uint32_t seq;            // Message sequence counter
+    uint8_t  magic;          // 1 byte  (MSG_TYPE_DATA = 0xA7)
+    uint16_t sender_id;      // 2 bytes
+    uint16_t target_id;      // 2 bytes
+    uint32_t session_id;     // 4 bytes
+    uint16_t sensor_value;   // 2 bytes
+    uint8_t  digital_value;  // 1 byte
+    uint32_t seq;            // 4 bytes
 };
 
-// Handshake Discovery Struct (HELLO / HELLO_ACK)
+// Handshake Discovery Struct (13 bytes: 1+2+2+4+4 = 13 bytes packed)
 struct __attribute__((__packed__)) HandshakeMessage {
-    uint8_t  magic;          // Magic header byte (MSG_TYPE_HELLO / MSG_TYPE_HELLO_ACK)
-    uint16_t sender_id;      // Custom compile-time sender node ID
-    uint16_t target_id;      // Custom compile-time target node ID
-    uint32_t session_id;     // Sender reboot/boot session incarnation token
-    uint32_t seq;            // Sequence counter / timestamp
+    uint8_t  magic;          // 1 byte  (MSG_TYPE_HELLO / MSG_TYPE_HELLO_ACK)
+    uint16_t sender_id;      // 2 bytes
+    uint16_t target_id;      // 2 bytes
+    uint32_t session_id;     // 4 bytes
+    uint32_t seq;            // 4 bytes
 };
+
+// Static assertions to ensure struct packing without undefined padding
+static_assert(sizeof(SensorMessage) == 16, "SensorMessage struct size must be exactly 16 bytes");
+static_assert(sizeof(HandshakeMessage) == 13, "HandshakeMessage struct size must be exactly 13 bytes");
+
+#define PAIR_WIRE_HEX_LEN      (sizeof(SensorMessage) * 2)     // 32 hex chars
+#define HANDSHAKE_WIRE_HEX_LEN (sizeof(HandshakeMessage) * 2)  // 26 hex chars
 
 // Peer Discovery State Machine
 enum class PeerState : uint8_t {

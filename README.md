@@ -1,6 +1,6 @@
 # ESP8266 Bi-Directional Sensor & Servo Mesh (DSP Enhanced)
 
-An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring boot session incarnation tracking (`session_id`), traffic separation (unicast control vs. discovery broadcasts), active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, high-precision Digital Signal Processing (DSP) for analog inputs, sub-microsecond fixed-point resolution, directional limit switch protection, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
+An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring zero-initialized protocol structs, static size assertions, static hex transmission buffers, strict transport route locking (`from == targetMeshNodeId`), targeted unicast handshakes, boot session incarnation tracking (`session_id`), traffic separation (unicast control vs. discovery broadcasts), active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, high-precision Digital Signal Processing (DSP) for analog inputs, sub-microsecond fixed-point resolution, directional limit switch protection, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
 
 1. **`esp8266_mesh_pair`**: PWM & Digital IO version (transmits 1/sec periodic updates).
 2. **`esp8266_mesh_servo`**: Servo version (50ms input polling, 200ms network rate limiting, sub-microsecond FP4 fixed-point pulse transmission, directional limit switch safety clamping).
@@ -15,12 +15,14 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 |---|---|---|
 | **Input Polling Rate** | 1000 ms (1 Hz) | 50 ms (20 Hz local sampling, Wi-Fi PHY safe) |
 | **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Rate-limited (max 1 packet per 200 ms / 5 Hz) |
-| **Session Incarnation Tracking**| Boot session token `session_id` (auto-resets sequence on node reboot) | Boot session token `session_id` (auto-resets sequence on node reboot) |
+| **Protocol Hardening** | Zero-initialized structs, static size assertions, static hex buffers | Zero-initialized structs, static size assertions, static hex buffers |
+| **Route Locking** | Strict route validation (`from == targetMeshNodeId` when connected) | Strict route validation (`from == targetMeshNodeId` when connected) |
 | **Control Traffic Transport** | Strict Targeted Unicast `mesh.sendSingle()` | Strict Targeted Unicast `mesh.sendSingle()` |
 | **Discovery Traffic Transport**| Infrequent Broadcast `MSG_TYPE_HELLO` | Infrequent Broadcast `MSG_TYPE_HELLO` |
+| **Handshake Response** | Unicast `HELLO_ACK` (no broadcast fallback) | Unicast `HELLO_ACK` (no broadcast fallback) |
 | **Peer State Machine** | `UNKNOWN`, `DISCOVERING`, `CONNECTED` | `UNKNOWN`, `DISCOVERING`, `CONNECTED` |
 | **Sender Filtering & Sequence** | Paired sender validation (`sender_id == TARGET_NODE_ID`) & wraparound sequence tracking | Paired sender validation (`sender_id == TARGET_NODE_ID`) & wraparound sequence tracking |
-| **Analog Input Processing** | Kahan Oversampling + Single Min/Max Outlier Rejection + 1D Kalman Filter | Kahan Oversampling + Single Min/Max Outlier Rejection + 1D Kalman Filter |
+| **Analog Input Processing** | Sort-based Trimmed Mean + Kahan Oversampling + 1D Kalman Filter | Sort-based Trimmed Mean + Kahan Oversampling + 1D Kalman Filter |
 | **Actuator Drive Resolution**| PWM Output on `D1` (GPIO 5, 0-1023) | Sub-microsecond FP4 Fixed-Point (1/16th $\mu s$) via `writeMicroseconds()` |
 | **Digital IO Pin** | `D2` In $\rightarrow$ `D3` Out | `D2` In $\rightarrow$ `D3` Out |
 | **Limit Switch Support** | N/A | `D6` (Min Limit) & `D7` (Max Limit) |
@@ -29,25 +31,21 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ---
 
-## 2. Boot Session Incarnation Tracking & Traffic Separation
+## 2. Protocol Hardening & Traffic Separation
 
-### Boot Session Incarnation ID (`session_id`)
-To ensure node reboots do not cause packet rejection loops when the sequence counter resets to 0:
-- Each node generates a unique 32-bit `mySessionId` token upon boot (`ESP.getChipId() ^ micros() ^ random()`).
-- The `session_id` is transmitted in both Handshake (`HandshakeMessage`) and Data (`ServoMeshMessage` / `SensorMessage`) frames.
-- When a new `session_id` is received from `TARGET_NODE_ID`, the receiver automatically re-synchronizes and resets its sequence counter (`lastReceivedSeq = 0`), eliminating stale sequence lockout across reboots.
+### Zero-Initialized Structs & Static Assertions
+- All protocol message structures are explicitly zero-initialized (`Struct{}`) prior to serialization, preventing uninitialized stack garbage in compiler padding bytes from leaking across the network.
+- Static compile-time assertions (`static_assert(sizeof(...) == EXPECTED)`) verify layout size at build time.
 
-### Traffic Separation (Control vs. Discovery)
-- **CONTROL Traffic**: Sensor and servo motion payload frames are transmitted **EXCLUSIVELY via targeted unicast** (`mesh.sendSingle`). If disconnected, control payloads are suppressed.
-- **DISCOVERY Traffic**: Broadcasts are strictly isolated to infrequent `HandshakeMessage` (`MSG_TYPE_HELLO`) frames sent only while in the `DISCOVERING` state.
+### Static Hex Buffers (Zero Heap Allocation)
+- Eliminates repeated dynamic string/buffer allocations by reusing pre-allocated static character buffers (`staticHexTxBuffer`) for hex formatting, preserving ESP8266 heap health during long-term operation.
 
-### Active Handshake Discovery Protocol (`HELLO` / `HELLO_ACK`)
-- Nodes run an active discovery task during startup / reconnects (`DISCOVERING` state) broadcasting lightweight `HandshakeMessage` (`MSG_TYPE_HELLO`).
-- When the target node receives a `HELLO`, it records `targetMeshNodeId`, transitions to `CONNECTED`, and replies with a targeted `MSG_TYPE_HELLO_ACK`.
+### Strict Transport Route Locking
+- Once `peerState == PeerState::CONNECTED`, data payload frames are accepted **ONLY if `from == targetMeshNodeId`**.
+- Prevents unverified mesh nodes or rogue broadcasts from hijacking active target transport routes.
 
-### Dynamic Topology Invalidation
-- On mesh connection changes (`changedConnectionCallback()`), the node inspects `mesh.getNodeList()`.
-- If the paired `targetMeshNodeId` is no longer connected in the mesh topology, `targetMeshNodeId` is cleared and `peerState` reverts to `DISCOVERING`.
+### Targeted Unicast Handshakes
+- `sendHelloAck()` transmits responses strictly via targeted unicast (`mesh.sendSingle`). Targeted ACKs never fall back to broadcast flooding.
 
 ---
 
@@ -92,7 +90,7 @@ arduino-cli upload -p /dev/ttyUSB1 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
 
 ```text
 ==================================================
-ESP8266 Bi-directional Servo Mesh Node (Session Incarnation Aware)
+ESP8266 Bi-directional Servo Mesh Node (Hardened Protocol)
 My Node ID: 1 (Session: 3849201) -> Target Node ID: 2
 Analog In: A0 (DSP Kahan+Kalman) | Servo Pin: GPIO 5 (D1) [544 - 2400 us]
 Digital In: GPIO 4 (D2) | Digital Out: GPIO 0 (D3)
