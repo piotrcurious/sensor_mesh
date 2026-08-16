@@ -1,9 +1,9 @@
 # ESP8266 Bi-Directional Sensor & Servo Mesh (DSP Enhanced)
 
-An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring top-level strict rate-limiting gates (200ms min interval), adaptive Kalman DSP filtering, boot session incarnation tracking (`session_id`), traffic separation (unicast control vs. discovery broadcasts), active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, sub-microsecond fixed-point resolution, directional limit switch protection, and microsecond-level actuator control. This repository provides two firmware variants:
+An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring handshake-only session installation (`session_id`), zero heap fragmentation, strict rate-limited unicast transmission, adaptive Kalman DSP filtering, traffic separation (unicast control vs. discovery broadcasts), active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, sub-microsecond fixed-point resolution, directional limit switch protection, and microsecond-level actuator control. This repository provides two firmware variants:
 
 1. **`esp8266_mesh_pair`**: PWM & Digital IO version (transmits 1/sec periodic updates).
-2. **`esp8266_mesh_servo`**: Servo version (50ms input polling, strict 200ms top-level network rate-limiting gate, sub-microsecond FP4 fixed-point pulse transmission, directional limit switch safety clamping).
+2. **`esp8266_mesh_servo`**: Servo version (50ms input polling, 200ms strict network rate limiting, sub-microsecond FP4 fixed-point pulse transmission, directional limit switch safety clamping).
 
 Both versions allow creating paired ESP8266 nodes (configured with simple compile-time node IDs) that communicate bi-directionally over an ad-hoc Wi-Fi mesh network using compact hex-encoded binary packed structs.
 
@@ -14,8 +14,9 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 | Feature | `esp8266_mesh_pair` (PWM Version) | `esp8266_mesh_servo` (Servo Version) |
 |---|---|---|
 | **Input Polling Rate** | 1000 ms (1 Hz) | 50 ms (20 Hz local sampling, Wi-Fi PHY safe) |
-| **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Top-level rate-limit gate (max 1 packet per 200 ms / 5 Hz) |
-| **Protocol Hardening** | Zero-initialized structs, static size assertions, static hex buffers | Zero-initialized structs, static size assertions, static hex buffers |
+| **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Rate-limited (max 1 packet per 200 ms / 5 Hz) |
+| **Session Incarnation Policy** | Handshake-Only Session Installation (`MSG_TYPE_HELLO` / `HELLO_ACK`) | Handshake-Only Session Installation (`MSG_TYPE_HELLO` / `HELLO_ACK`) |
+| **Heap Memory Optimization** | Zero dynamic heap allocations (pre-reserved `txPayloadString` & static hex buffers) | Zero dynamic heap allocations (pre-reserved `txPayloadString` & static hex buffers) |
 | **Route Locking** | Strict route validation (`from == targetMeshNodeId` when connected) | Strict route validation (`from == targetMeshNodeId` when connected) |
 | **Control Traffic Transport** | Strict Targeted Unicast `mesh.sendSingle()` | Strict Targeted Unicast `mesh.sendSingle()` |
 | **Discovery Traffic Transport**| Infrequent Broadcast `MSG_TYPE_HELLO` | Infrequent Broadcast `MSG_TYPE_HELLO` |
@@ -31,16 +32,21 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ---
 
-## 2. Strict Top-Level Rate-Limiting Gate & Adaptive DSP
+## 2. Handshake-Only Session Installation & Zero Heap Overhead
 
-### Strict Top-Level Rate-Limiting Gate (200 ms)
-- Evaluates `if (lastTxTime != 0 && (now - lastTxTime < MIN_TX_INTERVAL_MS)) return;` at the very beginning of network packet processing.
-- Strictly caps network broadcasts/unicasts at 5 Hz (1 packet per 200 ms max), regardless of how rapidly inputs change.
-- High-frequency 50 ms input polling continues locally, updating local limit switch safety clamping immediately without waiting for network transmission timers.
+### Strict Handshake-Only Session Installation (`session_id`)
+To prevent session hijacking or stale sequence counter resets:
+- Each node generates a unique 32-bit `mySessionId` token upon boot (`ESP.getChipId() ^ micros() ^ ESP.getCycleCount() ^ random()`).
+- Sessions are installed **EXCLUSIVELY via valid `HELLO` or `HELLO_ACK` handshakes**.
+- Data payload frames (`MSG_TYPE_DATA`) **NEVER establish or reset sessions**. Incoming data frames with mismatched or stale `session_id` tokens are DROPPED immediately.
 
-### Adaptive 1D Kalman Filter
-- Dynamic process noise $Q$ scales automatically with input motion innovation (`fabsf(averageAdc - kalman_x)`).
-- Eliminates motion lag and step response latency during rapid input changes while maintaining heavy noise smoothing when stationary.
+### Zero Heap Allocation Strategy
+- Reusable static hex character buffers (`staticHexTxBuffer`) are combined with pre-reserved static `String` buffers (`txPayloadString.reserve(...)`) during `setup()`.
+- Eliminates repeated dynamic creation and destruction of `String` heap objects on the ESP8266 during long-term operation.
+
+### Unicast Local Queueing Semantics (`sendSingle()`)
+- Note: `mesh.sendSingle()` returning `true` indicates successful acceptance and queueing by the local painlessMesh routing layer.
+- Unicast transmission suppresses network flooding while isolating control traffic.
 
 ---
 
@@ -85,7 +91,7 @@ arduino-cli upload -p /dev/ttyUSB1 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
 
 ```text
 ==================================================
-ESP8266 Bi-directional Servo Mesh Node (Strict Rate-Limited Unicast)
+ESP8266 Bi-directional Servo Mesh Node (Handshake-Only Sessions)
 My Node ID: 1 (Session: 3849201) -> Target Node ID: 2
 Analog In: A0 (Adaptive Kahan+Kalman) | Servo Pin: GPIO 5 (D1) [544 - 2400 us]
 Digital In: GPIO 4 (D2) | Digital Out: GPIO 0 (D3)
@@ -93,8 +99,8 @@ Min Limit Pin: GPIO 12 (D6) | Max Limit Pin: GPIO 13 (D7)
 ==================================================
 [DISCOVERY #1] Sent HELLO broadcast for Target Node 2 (Session: 3849201)
 [HANDSHAKE] Received HELLO_ACK from Target Node 2 (MeshID: 312847102, Session: 9812402). Transitioned to CONNECTED.
-[SESSION] Established/Reset Target Session ID: 9812402 (Seq Reset to 0)
-[TX #1] Filtered ADC: 512.35 | Target Pulse: 1472.25 us (FP4: 23556) | Unicast Sent: SUCCESS (Session: 3849201)
+[SESSION] Handshake Established Active Target Session ID: 9812402 (Seq Reset to 0)
+[TX #1] Filtered ADC: 512.35 | Target Pulse: 1472.25 us (FP4: 23556) | Unicast Queued: SUCCESS (Session: 3849201)
 [RX #1] From Node: 2 (Session: 9812402) | Target Pulse: 1950.12 us (FP4: 31202) | Digital: 1 | MinLim: 0 | MaxLim: 0
 [SERVO FP4] Requested: 1950.12 us (31202) -> Applied: 1950 us (31202 FP4) | LastSafe: 31202 FP4 (MinLim: 0, MaxLim: 0)
 ```

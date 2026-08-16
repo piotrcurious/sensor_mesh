@@ -1,28 +1,29 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Adaptive DSP & Strict Rate-Limited Unicast)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Handshake-Only Sessions & Heap Optimized)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Hardening Enhancements:
+  - Strict Handshake-Only Session Installation:
+    * DATA packets are NEVER permitted to establish or reset a session.
+    * DATA packets must strictly match active targetSessionId. Stale, unauthenticated, or mismatched
+      session DATA packets are immediately DROPPED.
+    * Sessions are installed EXCLUSIVELY via MSG_TYPE_HELLO / MSG_TYPE_HELLO_ACK handshakes.
+  - Zero Heap Allocation Strategy:
+    * Uses a static reusable String txPayloadString with pre-reserved capacity (reserve()),
+      preventing repeated creation/destruction of String objects on the ESP8266 heap.
+  - Hardened Boot Nonce Generation:
+    * Combines ESP.getChipId(), micros(), ESP.getCycleCount(), and random() for boot incarnation.
   - Strict Rate Limiting Gate:
-    * Enforces a hard time gate (now - lastTxTime < MIN_TX_INTERVAL_MS) at the very start of packet evaluation.
-    * Guarantees that under continuous analog potentiometer movement, outgoing network data broadcasts
-      are strictly capped at a maximum rate of 1 packet per 200 ms (5 Hz max transmission rate).
+    * Enforces a hard time gate (now - lastTxTime < MIN_TX_INTERVAL_MS) at the start of packet evaluation.
   - Adaptive 1D Kalman Filter:
-    * Dynamic process noise Q scales with motion innovation, eliminating motion lag
-      during rapid input changes while maintaining heavy noise smoothing when stationary.
-  - Rate Limiting & Input Polling Cooperation:
-    * Local limit switch state tracking updates local safety clamping immediately on every 50ms poll
-      without waiting for network timers.
+    * Dynamic process noise Q scales with motion innovation, eliminating motion lag.
   - Protocol Integrity & Zero-Initialization:
     * Zero-initializes all C++ structs (Struct{}) to prevent stack garbage leakage in padding bytes.
     * Static compile-time size assertions (static_assert) guarantee wire format structure size.
-  - Heap / String Overhead Optimization:
-    * Uses pre-allocated static character buffers to format hex payloads, eliminating heap fragmentation.
   - Strict Transport Route Validation:
     * Once CONNECTED, data payloads are accepted ONLY if from == targetMeshNodeId.
   - Targeted Unicast Handshakes:
     * HELLO_ACK is sent strictly via unicast; targeted ACKs do NOT fall back to broadcast.
-  - PeerState Enum: UNKNOWN, DISCOVERING, CONNECTED.
   - Sub-microsecond Fixed-Point Precision (FP4 = 1/16th us resolution).
   - Directional limit switch safety clamping.
 */
@@ -59,7 +60,7 @@ static uint32_t mySessionId = 0;
 // Peer Discovery State Machine & Remote Session Tracking
 static PeerState peerState = PeerState::UNKNOWN;
 static uint32_t targetMeshNodeId = 0; // Discovered painlessMesh uint32_t node ID for TARGET_NODE_ID
-static uint32_t targetSessionId = 0;  // Active boot session ID of TARGET_NODE_ID
+static uint32_t targetSessionId = 0;  // Active boot session ID of TARGET_NODE_ID installed via handshake
 
 // Kalman Filter State
 static float kalman_x = 512.0f;
@@ -83,8 +84,9 @@ static uint16_t requestedServoUsFp4 = 23552; // 1472 us * 16
 static uint16_t appliedServoUsFp4   = 23552;
 static uint16_t lastSafeUsFp4       = 23552;
 
-// Reusable static buffer for hex formatting to prevent heap fragmentation
+// Reusable static character buffer & static reserved String payload to prevent heap fragmentation
 static char staticHexTxBuffer[SERVO_WIRE_HEX_LEN + 1];
+static String txPayloadString;
 
 // Helper: Convert uint8_t hex character to byte
 static uint8_t hexCharToNibble(char c) {
@@ -105,13 +107,13 @@ bool isNewerSequence(uint32_t incoming, uint32_t last) {
 }
 
 /**
- * Resets target sequence state for a new session incarnation.
+ * Resets target sequence state EXCLUSIVELY upon authentic handshake session establishment.
  */
 static void resetSessionSequence(uint32_t newSessionId) {
     targetSessionId = newSessionId;
     lastReceivedSeq = 0;
     hasReceivedFirstPacket = false;
-    Serial.printf("[SESSION] Established/Reset Target Session ID: %u (Seq Reset to 0)\n", newSessionId);
+    Serial.printf("[SESSION] Handshake Established Active Target Session ID: %u (Seq Reset to 0)\n", newSessionId);
 }
 
 /**
@@ -157,7 +159,7 @@ float readAnalogFiltered() {
     float innovation = fabsf(averageAdc - kalman_x);
     float dynamicQ = KALMAN_PROCESS_NOISE_Q;
     if (innovation > 10.0f) {
-        dynamicQ = innovation * 0.1f; // High dynamic tracking gain during active motion
+        dynamicQ = innovation * 0.1f;
     }
 
     kalman_p = kalman_p + dynamicQ;
@@ -172,12 +174,15 @@ void setup() {
     Serial.begin(115200);
     delay(500);
 
-    // Generate unique session incarnation token for this boot
-    mySessionId = ESP.getChipId() ^ micros() ^ (uint32_t)random(0xFFFF);
+    // Hardened unique boot session nonce generation
+    mySessionId = ESP.getChipId() ^ micros() ^ ESP.getCycleCount() ^ (uint32_t)random(0xFFFFFFFF);
+
+    // Pre-reserve static txPayloadString capacity to prevent heap allocations
+    txPayloadString.reserve(SERVO_WIRE_HEX_LEN + 1);
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Strict Rate-Limited Unicast)\n");
+    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Handshake-Only Sessions)\n");
     Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (Adaptive Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
                   SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
@@ -245,7 +250,8 @@ void sendHelloDiscovery() {
     }
     staticHexTxBuffer[HANDSHAKE_WIRE_HEX_LEN] = '\0';
 
-    mesh.sendBroadcast(String(staticHexTxBuffer));
+    txPayloadString = staticHexTxBuffer;
+    mesh.sendBroadcast(txPayloadString);
 
     Serial.printf("[DISCOVERY #%u] Sent HELLO broadcast for Target Node %u (Session: %u)\n",
                   helloMsg.seq, TARGET_NODE_ID, mySessionId);
@@ -269,8 +275,8 @@ void sendHelloAck(uint32_t destMeshId) {
     }
     staticHexTxBuffer[HANDSHAKE_WIRE_HEX_LEN] = '\0';
 
-    // Strict Unicast - no broadcast fallback for targeted ACKs
-    mesh.sendSingle(destMeshId, String(staticHexTxBuffer));
+    txPayloadString = staticHexTxBuffer;
+    mesh.sendSingle(destMeshId, txPayloadString);
 
     Serial.printf("[DISCOVERY #%u] Sent targeted HELLO_ACK to Target Node %u (MeshID: %u, Session: %u)\n",
                   ackMsg.seq, TARGET_NODE_ID, destMeshId, mySessionId);
@@ -311,8 +317,6 @@ void checkAndTransmitInputs() {
     }
 
     // STRICT NETWORK RATE-LIMITING GATE:
-    // If less than MIN_TX_INTERVAL_MS (200 ms) has elapsed since the last transmission attempt,
-    // exit immediately to prevent sending packets faster than 5 Hz.
     uint32_t now = millis();
     if (lastTxTime != 0 && (now - lastTxTime < MIN_TX_INTERVAL_MS)) {
         return;
@@ -346,11 +350,12 @@ void checkAndTransmitInputs() {
         }
         staticHexTxBuffer[SERVO_WIRE_HEX_LEN] = '\0';
 
-        // Unconditionally update lastTxTime to lock out transmissions for at least MIN_TX_INTERVAL_MS
         lastTxTime = now;
 
+        txPayloadString = staticHexTxBuffer;
+
         // Strict Unicast CONTROL Transmission
-        bool sentDirect = mesh.sendSingle(targetMeshNodeId, String(staticHexTxBuffer));
+        bool sentDirect = mesh.sendSingle(targetMeshNodeId, txPayloadString);
 
         if (sentDirect) {
             lastTransmittedUsFp4 = currentUsFp4;
@@ -359,7 +364,7 @@ void checkAndTransmitInputs() {
             lastMaxLimit = currentMaxLimit;
         }
 
-        Serial.printf("[TX #%u] Filtered ADC: %.2f | Target Pulse: %.2f us (FP4: %u) | Unicast Sent: %s (Session: %u)\n",
+        Serial.printf("[TX #%u] Filtered ADC: %.2f | Target Pulse: %.2f us (FP4: %u) | Unicast Queued: %s (Session: %u)\n",
                       msg.seq, filteredAdc, (float)currentUsFp4 / 16.0f, currentUsFp4,
                       sentDirect ? "SUCCESS" : "FAILED", mySessionId);
     }
@@ -400,10 +405,10 @@ void updateLocalServoFp4(uint16_t newRequestedUsFp4) {
 
 /**
  * Callback when a mesh message is received.
- * Performs strict transport route validation once connected.
+ * Strict Session Integrity: DATA messages NEVER establish sessions. Handshakes installed sessions exclusively.
  */
 void receivedCallback(uint32_t from, String &msg) {
-    // 1. Check for Handshake Messages (HELLO / HELLO_ACK)
+    // 1. Check for Handshake Messages (HELLO / HELLO_ACK) - EXCLUSIVE session installation mechanism
     if (msg.length() == HANDSHAKE_WIRE_HEX_LEN) {
         HandshakeMessage handshake{};
         uint8_t* rawBytes = (uint8_t*)&handshake;
@@ -434,13 +439,17 @@ void receivedCallback(uint32_t from, String &msg) {
 
     // 2. Check for Data Payload Messages
     if (msg.length() != SERVO_WIRE_HEX_LEN) {
+        return; // Size mismatch
+    }
+
+    // HARDENED FILTERING RULE 1: Must be in CONNECTED state
+    if (peerState != PeerState::CONNECTED) {
         return;
     }
 
-    // Strict Transport Route Validation:
-    // Once CONNECTED, reject data payloads originating from any transport node ID other than targetMeshNodeId
-    if (peerState == PeerState::CONNECTED && from != targetMeshNodeId) {
-        Serial.printf("[RX ROUTE REJECT] Ignored DATA payload from unverified MeshID %u (Active Target MeshID: %u)\n",
+    // HARDENED FILTERING RULE 2: Must originate from active targetMeshNodeId
+    if (from != targetMeshNodeId) {
+        Serial.printf("[RX REJECT] DATA payload from unverified MeshID %u (Active Target MeshID: %u)\n",
                       from, targetMeshNodeId);
         return;
     }
@@ -458,21 +467,20 @@ void receivedCallback(uint32_t from, String &msg) {
         return;
     }
 
-    // Explicit Sender & Target Validation
+    // HARDENED FILTERING RULE 3: Explicit Sender & Target Validation
     if (incoming.sender_id != TARGET_NODE_ID || incoming.target_id != MY_NODE_ID) {
         return;
     }
 
-    // Auto-discover / verify target mesh ID & check session incarnation change
-    targetMeshNodeId = from;
-    if (peerState != PeerState::CONNECTED || incoming.session_id != targetSessionId) {
-        peerState = PeerState::CONNECTED;
-        resetSessionSequence(incoming.session_id);
-        Serial.printf("[STATE] Synchronized Target MeshID %u with new Session ID %u. Transitioned to CONNECTED.\n",
-                      from, incoming.session_id);
+    // HARDENED FILTERING RULE 4: Strict Active Session ID Matching
+    // DATA payloads CANNOT establish or reset sessions. Stale or unauthenticated session IDs are DROPPED.
+    if (incoming.session_id != targetSessionId) {
+        Serial.printf("[RX SESSION REJECT] Dropped DATA with stale/unmatched Session ID %u (Active Session: %u)\n",
+                      incoming.session_id, targetSessionId);
+        return;
     }
 
-    // Single-source sequence check for active session
+    // HARDENED FILTERING RULE 5: Single-Source Sequence Check for active session
     if (!isNewerSequence(incoming.seq, lastReceivedSeq)) {
         Serial.printf("[RX DROP #%u] Out-of-order or duplicate packet dropped (Last Seq: %u, Sender Session: %u)\n",
                       incoming.seq, lastReceivedSeq, incoming.session_id);
