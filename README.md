@@ -3,7 +3,7 @@
 An auto-organizing ESP8266 mesh network built using `painlessMesh`. This repository provides two firmware variants:
 
 1. **`esp8266_mesh_pair`**: PWM & Digital IO version (transmits 1/sec periodic updates).
-2. **`esp8266_mesh_servo`**: Servo version (event-driven updates on state changes, limit switch support, and local motion clamping).
+2. **`esp8266_mesh_servo`**: Servo version (event-driven updates on state changes, calibrated micro-servo pulse durations, limit switch support, and local motion clamping).
 
 Both versions allow creating paired ESP8266 nodes (configured with simple compile-time node IDs) that communicate bi-directionally over an ad-hoc Wi-Fi mesh network using compact hex-encoded binary packed structs.
 
@@ -15,7 +15,7 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 |---|---|---|
 | **Transmission Trigger** | Periodic timer (1/sec = 1000 ms) | Event-driven (immediate on input change) + 5s heartbeat |
 | **Analog Input Pin** | `A0` (0–1023) | `A0` (0–1023) |
-| **Primary Actuator** | PWM Output on `D1` (GPIO 5) | Servo Motor on `D1` (GPIO 5, 0–180°) |
+| **Primary Actuator** | PWM Output on `D1` (GPIO 5) | Servo Motor on `D1` (GPIO 5, calibrated 544–2400 $\mu s$ pulse range) |
 | **Digital IO Pin** | `D2` In $\rightarrow$ `D3` Out | `D2` In $\rightarrow$ `D3` Out |
 | **Limit Switch Support** | N/A | `D6` (Min Limit) & `D7` (Max Limit) |
 | **Limit Switch Behavior**| N/A | Transmitted to paired node & clamps local servo movement |
@@ -35,7 +35,10 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
      - **Node 1**: `MY_NODE_ID = 1`, `TARGET_NODE_ID = 2`
      - **Node 2**: `MY_NODE_ID = 2`, `TARGET_NODE_ID = 1`
 
-3. **Compact Packed Binary Message Struct (Hex Encoded)**:
+3. **Calibrated Servo Pulse Width**:
+   - Uses `myServo.attach(SERVO_PIN, 544, 2400)` to ensure micro-servos (SG90, MG996R) achieve full $0^\circ - 180^\circ$ rotation range.
+
+4. **Compact Packed Binary Message Struct (Hex Encoded)**:
    - Data is packed into byte-aligned structs and hex-encoded to guarantee that null bytes (`0x00`) within multi-byte integers do not truncate the string during painlessMesh JSON transport.
 
    **Servo Mesh Struct (`ServoMeshMessage`):**
@@ -52,7 +55,7 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
    };
    ```
 
-4. **Event-Driven Transmission & Local Limit Switch Clamping**:
+5. **Event-Driven Transmission & Local Limit Switch Clamping**:
    - The Servo version monitors inputs every 50 ms and sends packet updates instantly whenever an analog value changes beyond `ANALOG_CHANGE_THRESHOLD` (8 counts), or whenever digital inputs / limit switch states change.
    - Limit switches on `D6` (Min Limit) and `D7` (Max Limit) actively clamp the local servo angle (preventing over-rotation past physical end-stops) while transmitting switch states across the mesh to the remote node.
 
@@ -72,7 +75,7 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 | Function | ESP8266 Pin | Notes |
 |---|---|---|
 | **Analog Sensor Input** | `A0` | ESP8266 ADC input pin (0 to 1.0V/3.3V, 10-bit resolution: 0–1023) |
-| **PWM Output / Servo Signal** | `D1` (GPIO 5) | PWM output in `esp8266_mesh_pair` or Servo PWM signal in `esp8266_mesh_servo` |
+| **PWM Output / Servo Signal** | `D1` (GPIO 5) | PWM output in `esp8266_mesh_pair` or Servo signal in `esp8266_mesh_servo` (544–2400 $\mu s$) |
 | **Digital Input** | `D2` (GPIO 4) | Input pin read by sending node (`INPUT_PULLUP`) |
 | **Digital Output** | `D3` (GPIO 0) | Output pin driven by received paired node digital state (`digitalWrite`) |
 | **Min Limit Switch** | `D6` (GPIO 12) | Min position limit switch in `esp8266_mesh_servo` (Active LOW `INPUT_PULLUP`) |
@@ -164,7 +167,7 @@ arduino-cli upload -p /dev/ttyUSB1 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
    ==================================================
    ESP8266 Bi-directional Servo & Sensor Mesh Node
    My Node ID: 1 -> Target Node ID: 2
-   Analog In: A0 | Servo Pin: GPIO 5 (D1)
+   Analog In: A0 | Servo Pin: GPIO 5 (D1) [Pulse: 544 - 2400 us]
    Digital In: GPIO 4 (D2) | Digital Out: GPIO 0 (D3)
    Min Limit Pin: GPIO 12 (D6) | Max Limit Pin: GPIO 13 (D7)
    ==================================================

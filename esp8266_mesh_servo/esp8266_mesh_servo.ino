@@ -7,6 +7,7 @@
     (analog input A0, digital input D2, min limit switch D6, max limit switch D7),
     plus periodic heartbeat transmissions.
   - Controls local Servo motor (D1) based on target node analog position.
+  - Servo pulse-width range calibrated (544 us to 2400 us) for standard micro-servos (e.g. SG90/MG996R).
   - Local limit switch clamping: limit switches (D6, D7) clamp local servo movement
     to protect physical hardware.
   - Transmits local limit switch states to corresponding paired node.
@@ -59,7 +60,8 @@ void setup() {
     Serial.println("==================================================");
     Serial.printf("ESP8266 Bi-directional Servo & Sensor Mesh Node\n");
     Serial.printf("My Node ID: %u -> Target Node ID: %u\n", MY_NODE_ID, TARGET_NODE_ID);
-    Serial.printf("Analog In: A0 | Servo Pin: GPIO %d (D1)\n", SERVO_PIN);
+    Serial.printf("Analog In: A0 | Servo Pin: GPIO %d (D1) [Pulse: %d - %d us]\n",
+                  SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
     Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
     Serial.printf("Min Limit Pin: GPIO %d (D6) | Max Limit Pin: GPIO %d (D7)\n", MIN_LIMIT_PIN, MAX_LIMIT_PIN);
     Serial.println("==================================================");
@@ -74,8 +76,8 @@ void setup() {
     pinMode(MIN_LIMIT_PIN, INPUT_PULLUP);
     pinMode(MAX_LIMIT_PIN, INPUT_PULLUP);
 
-    // Attach Servo
-    myServo.attach(SERVO_PIN);
+    // Attach Servo with calibrated pulse width range (544 to 2400 us)
+    myServo.attach(SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
     updateLocalServoAngle(currentTargetAnalogVal);
 
     // Initialize painlessMesh network

@@ -40,11 +40,15 @@
 #define MAX_LIMIT_PIN D7
 
 // ============================================================================
-// Servo Parameters
+// Servo Parameters & Pulse Calibration
 // ============================================================================
 
 #define SERVO_MIN_ANGLE 0
 #define SERVO_MAX_ANGLE 180
+
+// Micro-servo pulse durations in microseconds for full 0 to 180 degree range
+#define SERVO_MIN_PULSE_WIDTH 544
+#define SERVO_MAX_PULSE_WIDTH 2400
 
 // Change detection thresholds
 #define ANALOG_CHANGE_THRESHOLD 8 // Minimum ADC delta (~0.8% change) to trigger transmission
