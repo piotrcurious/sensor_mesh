@@ -1,8 +1,15 @@
 /*
-  ESP8266 Bi-directional Sensor Mesh Node Firmware (Hardened Protocol & Fixed Buffers)
+  ESP8266 Bi-directional Sensor Mesh Node Firmware (Adaptive DSP & Rate-Limited Unicast)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Hardening Enhancements:
+  - Adaptive 1D Kalman Filter:
+    * Dynamic process noise Q scales with motion innovation, eliminating motion lag
+      during rapid input changes while maintaining heavy noise smoothing when stationary.
+  - Rate Limiting & Input Polling Cooperation:
+    * Comparing current sampled state against LAST TRANSMITTED state drops intermediate
+      transient states during rate-limit windows rather than deferring them.
+    * Only updates lastTransmitted state tracking upon successful unicast delivery.
   - Protocol Integrity & Zero-Initialization:
     * Zero-initializes all C++ structs (Struct{}) to prevent stack garbage leakage in padding bytes.
     * Static compile-time size assertions (static_assert) guarantee wire format structure size.
@@ -10,14 +17,9 @@
     * Uses pre-allocated static character buffers to format hex payloads, eliminating heap fragmentation.
   - Strict Transport Route Validation:
     * Once CONNECTED, data payloads are accepted ONLY if from == targetMeshNodeId.
-      Prevents route hijacking or unverified mesh nodes from overwriting active target routes.
   - Targeted Unicast Handshakes:
-    * HELLO_ACK is sent strictly via unicast; targeted ACKs do NOT fall back to broadcast flooding.
-  - Multi-Spike Trimmed-Mean ADC Filtering:
-    * Sorts ADC samples in place to cleanly strip highest and lowest extremes regardless of duplicate values.
+    * HELLO_ACK is sent strictly via unicast; targeted ACKs do NOT fall back to broadcast.
   - PeerState Enum: UNKNOWN, DISCOVERING, CONNECTED.
-  - High-Precision DSP filtering (Kahan summation, outlier rejection, 1D Kalman filter).
-  - Drives PWM pin (D1) and digital output pin (D3).
 */
 
 #include <painlessMesh.h>
@@ -93,7 +95,7 @@ static void resetSessionSequence(uint32_t newSessionId) {
 }
 
 /**
- * High-Precision Analog Read with Sort-Based Trimmed Mean & Kahan Summation.
+ * High-Precision Analog Read with Sort-Based Trimmed Mean, Kahan Summation, and Adaptive Kalman Filter.
  */
 float readAnalogFiltered() {
     uint16_t samples[ADC_OVERSAMPLE_COUNT];
@@ -115,7 +117,7 @@ float readAnalogFiltered() {
         }
     }
 
-    // 3. Kahan Summation on interior trimmed samples (stripping 1 min and 1 max)
+    // 3. Kahan Summation on interior trimmed samples
     float sum = 0.0f;
     float c = 0.0f;
     size_t startIndex = (ADC_OVERSAMPLE_COUNT >= 4) ? 1 : 0;
@@ -131,8 +133,15 @@ float readAnalogFiltered() {
 
     float averageAdc = (count > 0) ? (sum / (float)count) : (float)samples[0];
 
-    // 4. 1D Kalman Filter Update
-    kalman_p = kalman_p + KALMAN_PROCESS_NOISE_Q;
+    // 4. Adaptive 1D Kalman Filter Update:
+    // Dynamic process noise Q scales with motion innovation to eliminate motion lag on step changes
+    float innovation = fabsf(averageAdc - kalman_x);
+    float dynamicQ = KALMAN_PROCESS_NOISE_Q;
+    if (innovation > 10.0f) {
+        dynamicQ = innovation * 0.1f;
+    }
+
+    kalman_p = kalman_p + dynamicQ;
     float k_gain = kalman_p / (kalman_p + KALMAN_MEASUREMENT_NOISE_R);
     kalman_x = kalman_x + k_gain * (averageAdc - kalman_x);
     kalman_p = (1.0f - k_gain) * kalman_p;

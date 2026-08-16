@@ -1,8 +1,17 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Hardened Protocol & Fixed Buffers)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Adaptive DSP & Rate-Limited Unicast)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Hardening Enhancements:
+  - Adaptive 1D Kalman Filter:
+    * Dynamic process noise Q scales with motion innovation, eliminating motion lag
+      during rapid input changes while maintaining heavy noise smoothing when stationary.
+  - Rate Limiting & Input Polling Cooperation:
+    * Local limit switch state tracking updates local safety clamping immediately without waiting
+      for network timers.
+    * Network state change checking compares current poll reading directly against LAST TRANSMITTED
+      state, dropping intermediate transient states during rate-limit windows rather than deferring them.
+    * Only updates lastTransmitted state tracking upon successful unicast delivery.
   - Protocol Integrity & Zero-Initialization:
     * Zero-initializes all C++ structs (Struct{}) to prevent stack garbage leakage in padding bytes.
     * Static compile-time size assertions (static_assert) guarantee wire format structure size.
@@ -10,11 +19,8 @@
     * Uses pre-allocated static character buffers to format hex payloads, eliminating heap fragmentation.
   - Strict Transport Route Validation:
     * Once CONNECTED, data payloads are accepted ONLY if from == targetMeshNodeId.
-      Prevents route hijacking or unverified mesh nodes from overwriting active target routes.
   - Targeted Unicast Handshakes:
-    * HELLO_ACK is sent strictly via unicast; targeted ACKs do NOT fall back to broadcast flooding.
-  - Multi-Spike Trimmed-Mean ADC Filtering:
-    * Sorts ADC samples in place to cleanly strip highest and lowest extremes regardless of duplicate values.
+    * HELLO_ACK is sent strictly via unicast; targeted ACKs do NOT fall back to broadcast.
   - PeerState Enum: UNKNOWN, DISCOVERING, CONNECTED.
   - Sub-microsecond Fixed-Point Precision (FP4 = 1/16th us resolution).
   - Directional limit switch safety clamping.
@@ -108,7 +114,7 @@ static void resetSessionSequence(uint32_t newSessionId) {
 }
 
 /**
- * High-Precision Analog Read with Sort-Based Trimmed Mean & Kahan Summation.
+ * High-Precision Analog Read with Sort-Based Trimmed Mean, Kahan Summation, and Adaptive Kalman Filter.
  */
 float readAnalogFiltered() {
     uint16_t samples[ADC_OVERSAMPLE_COUNT];
@@ -130,7 +136,7 @@ float readAnalogFiltered() {
         }
     }
 
-    // 3. Kahan Summation on interior trimmed samples (stripping 1 min and 1 max)
+    // 3. Kahan Summation on interior trimmed samples
     float sum = 0.0f;
     float c = 0.0f;
     size_t startIndex = (ADC_OVERSAMPLE_COUNT >= 4) ? 1 : 0;
@@ -146,8 +152,15 @@ float readAnalogFiltered() {
 
     float averageAdc = (count > 0) ? (sum / (float)count) : (float)samples[0];
 
-    // 4. 1D Kalman Filter Update
-    kalman_p = kalman_p + KALMAN_PROCESS_NOISE_Q;
+    // 4. Adaptive 1D Kalman Filter Update:
+    // Dynamic process noise Q scales with motion innovation to eliminate motion lag on step changes
+    float innovation = fabsf(averageAdc - kalman_x);
+    float dynamicQ = KALMAN_PROCESS_NOISE_Q;
+    if (innovation > 10.0f) {
+        dynamicQ = innovation * 0.1f; // High dynamic tracking gain during active motion
+    }
+
+    kalman_p = kalman_p + dynamicQ;
     float k_gain = kalman_p / (kalman_p + KALMAN_MEASUREMENT_NOISE_R);
     kalman_x = kalman_x + k_gain * (averageAdc - kalman_x);
     kalman_p = (1.0f - k_gain) * kalman_p;
@@ -164,9 +177,9 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Hardened Protocol)\n");
+    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Adaptive DSP & Rate-Limited Unicast)\n");
     Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
-    Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
+    Serial.printf("Analog In: A0 (Adaptive Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
                   SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
     Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
     Serial.printf("Min Limit Pin: GPIO %d (D6) | Max Limit Pin: GPIO %d (D7)\n", MIN_LIMIT_PIN, MAX_LIMIT_PIN);
@@ -264,7 +277,9 @@ void sendHelloAck(uint32_t destMeshId) {
 }
 
 /**
- * Polls inputs and transmits CONTROL payload data EXCLUSIVELY via targeted UNICAST (sendSingle).
+ * Polls inputs at 50 ms intervals.
+ * Updates local safety clamping immediately without waiting for network timers.
+ * Transmits CONTROL payloads EXCLUSIVELY via targeted UNICAST (sendSingle) when rate limit permits.
  */
 void checkAndTransmitInputs() {
     float filteredAdc = readAnalogFiltered();
@@ -281,7 +296,12 @@ void checkAndTransmitInputs() {
     uint8_t currentMinLimit = (digitalRead(MIN_LIMIT_PIN) == LOW) ? 1 : 0;
     uint8_t currentMaxLimit = (digitalRead(MAX_LIMIT_PIN) == LOW) ? 1 : 0;
 
-    if (currentMinLimit != lastMinLimit || currentMaxLimit != lastMaxLimit) {
+    // Local limit switch reaction: update local safety clamping immediately on poll
+    static uint8_t lastLocalMinLimit = 0xFF;
+    static uint8_t lastLocalMaxLimit = 0xFF;
+    if (currentMinLimit != lastLocalMinLimit || currentMaxLimit != lastLocalMaxLimit) {
+        lastLocalMinLimit = currentMinLimit;
+        lastLocalMaxLimit = currentMaxLimit;
         updateLocalServoFp4(requestedServoUsFp4);
     }
 
@@ -290,6 +310,7 @@ void checkAndTransmitInputs() {
         return;
     }
 
+    // Compare current sampled state against LAST TRANSMITTED state
     bool pulseChanged = (abs((int)currentUsFp4 - (int)lastTransmittedUsFp4) >= PULSE_FP4_CHANGE_THRESHOLD);
     bool digitalChanged = (currentDigital != lastDigitalVal);
     bool minLimitChanged = (currentMinLimit != lastMinLimit);
@@ -301,7 +322,7 @@ void checkAndTransmitInputs() {
     bool heartbeatElapsed = (now - lastTxTime >= HEARTBEAT_INTERVAL_MS);
 
     if ((stateChanged && rateLimitElapsed) || heartbeatElapsed) {
-        ServoMeshMessage msg{}; // Zero-initialized struct to prevent padding garbage
+        ServoMeshMessage msg{}; // Zero-initialized struct
         msg.magic = MSG_TYPE_DATA;
         msg.sender_id = MY_NODE_ID;
         msg.target_id = TARGET_NODE_ID;
@@ -322,11 +343,13 @@ void checkAndTransmitInputs() {
         // Strict Unicast CONTROL Transmission
         bool sentDirect = mesh.sendSingle(targetMeshNodeId, String(staticHexTxBuffer));
 
-        lastTransmittedUsFp4 = currentUsFp4;
-        lastDigitalVal = currentDigital;
-        lastMinLimit = currentMinLimit;
-        lastMaxLimit = currentMaxLimit;
-        lastTxTime = now;
+        if (sentDirect) {
+            lastTransmittedUsFp4 = currentUsFp4;
+            lastDigitalVal = currentDigital;
+            lastMinLimit = currentMinLimit;
+            lastMaxLimit = currentMaxLimit;
+            lastTxTime = now;
+        }
 
         Serial.printf("[TX #%u] Filtered ADC: %.2f | Target Pulse: %.2f us (FP4: %u) | Unicast Sent: %s (Session: %u)\n",
                       msg.seq, filteredAdc, (float)currentUsFp4 / 16.0f, currentUsFp4,
