@@ -1,20 +1,18 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Adaptive DSP & Rate-Limited Unicast)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Adaptive DSP & Strict Rate-Limited Unicast)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Hardening Enhancements:
-  - Network Rate Limiting Bug Fix:
-    * Updates lastTxTime = now unconditionally when a transmission attempt occurs.
-      Prevents 50ms polling loop from retrying transmission on every cycle if sentDirect returns false
-      or during connection transitions.
+  - Strict Rate Limiting Gate:
+    * Enforces a hard time gate (now - lastTxTime < MIN_TX_INTERVAL_MS) at the very start of packet evaluation.
+    * Guarantees that under continuous analog potentiometer movement, outgoing network data broadcasts
+      are strictly capped at a maximum rate of 1 packet per 200 ms (5 Hz max transmission rate).
   - Adaptive 1D Kalman Filter:
     * Dynamic process noise Q scales with motion innovation, eliminating motion lag
       during rapid input changes while maintaining heavy noise smoothing when stationary.
   - Rate Limiting & Input Polling Cooperation:
-    * Local limit switch state tracking updates local safety clamping immediately without waiting
-      for network timers.
-    * Network state change checking compares current poll reading directly against LAST TRANSMITTED
-      state, dropping intermediate transient states during rate-limit windows rather than deferring them.
+    * Local limit switch state tracking updates local safety clamping immediately on every 50ms poll
+      without waiting for network timers.
   - Protocol Integrity & Zero-Initialization:
     * Zero-initializes all C++ structs (Struct{}) to prevent stack garbage leakage in padding bytes.
     * Static compile-time size assertions (static_assert) guarantee wire format structure size.
@@ -156,7 +154,6 @@ float readAnalogFiltered() {
     float averageAdc = (count > 0) ? (sum / (float)count) : (float)samples[0];
 
     // 4. Adaptive 1D Kalman Filter Update:
-    // Dynamic process noise Q scales with motion innovation to eliminate motion lag on step changes
     float innovation = fabsf(averageAdc - kalman_x);
     float dynamicQ = KALMAN_PROCESS_NOISE_Q;
     if (innovation > 10.0f) {
@@ -180,7 +177,7 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Adaptive DSP & Rate-Limited Unicast)\n");
+    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Strict Rate-Limited Unicast)\n");
     Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (Adaptive Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
                   SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
@@ -282,7 +279,7 @@ void sendHelloAck(uint32_t destMeshId) {
 /**
  * Polls inputs at 50 ms intervals.
  * Updates local safety clamping immediately without waiting for network timers.
- * Transmits CONTROL payloads EXCLUSIVELY via targeted UNICAST (sendSingle) when rate limit permits.
+ * Transmits CONTROL payloads EXCLUSIVELY via targeted UNICAST (sendSingle) with a strict MIN_TX_INTERVAL_MS rate limit.
  */
 void checkAndTransmitInputs() {
     float filteredAdc = readAnalogFiltered();
@@ -313,6 +310,14 @@ void checkAndTransmitInputs() {
         return;
     }
 
+    // STRICT NETWORK RATE-LIMITING GATE:
+    // If less than MIN_TX_INTERVAL_MS (200 ms) has elapsed since the last transmission attempt,
+    // exit immediately to prevent sending packets faster than 5 Hz.
+    uint32_t now = millis();
+    if (lastTxTime != 0 && (now - lastTxTime < MIN_TX_INTERVAL_MS)) {
+        return;
+    }
+
     // Compare current sampled state against LAST TRANSMITTED state
     bool pulseChanged = (abs((int)currentUsFp4 - (int)lastTransmittedUsFp4) >= PULSE_FP4_CHANGE_THRESHOLD);
     bool digitalChanged = (currentDigital != lastDigitalVal);
@@ -320,11 +325,9 @@ void checkAndTransmitInputs() {
     bool maxLimitChanged = (currentMaxLimit != lastMaxLimit);
     bool stateChanged = (pulseChanged || digitalChanged || minLimitChanged || maxLimitChanged);
 
-    uint32_t now = millis();
-    bool rateLimitElapsed = (now - lastTxTime >= MIN_TX_INTERVAL_MS);
     bool heartbeatElapsed = (now - lastTxTime >= HEARTBEAT_INTERVAL_MS);
 
-    if ((stateChanged && rateLimitElapsed) || heartbeatElapsed) {
+    if (stateChanged || heartbeatElapsed) {
         ServoMeshMessage msg{}; // Zero-initialized struct
         msg.magic = MSG_TYPE_DATA;
         msg.sender_id = MY_NODE_ID;
@@ -343,7 +346,7 @@ void checkAndTransmitInputs() {
         }
         staticHexTxBuffer[SERVO_WIRE_HEX_LEN] = '\0';
 
-        // Always update lastTxTime so rate-limiting timer (MIN_TX_INTERVAL_MS) is strictly enforced
+        // Unconditionally update lastTxTime to lock out transmissions for at least MIN_TX_INTERVAL_MS
         lastTxTime = now;
 
         // Strict Unicast CONTROL Transmission

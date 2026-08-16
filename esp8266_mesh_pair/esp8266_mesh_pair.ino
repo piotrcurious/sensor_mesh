@@ -1,15 +1,14 @@
 /*
-  ESP8266 Bi-directional Sensor Mesh Node Firmware (Adaptive DSP & Rate-Limited Unicast)
+  ESP8266 Bi-directional Sensor Mesh Node Firmware (Adaptive DSP & Strict Rate-Limited Unicast)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Hardening Enhancements:
+  - Strict Rate Limiting Gate:
+    * Enforces a hard time gate (now - lastTxTime < MIN_TX_INTERVAL_MS) at the very start of packet evaluation.
+    * Guarantees that outgoing network data broadcasts are strictly capped at a maximum rate of 1 packet per 200 ms.
   - Adaptive 1D Kalman Filter:
     * Dynamic process noise Q scales with motion innovation, eliminating motion lag
       during rapid input changes while maintaining heavy noise smoothing when stationary.
-  - Rate Limiting & Input Polling Cooperation:
-    * Comparing current sampled state against LAST TRANSMITTED state drops intermediate
-      transient states during rate-limit windows rather than deferring them.
-    * Only updates lastTransmitted state tracking upon successful unicast delivery.
   - Protocol Integrity & Zero-Initialization:
     * Zero-initializes all C++ structs (Struct{}) to prevent stack garbage leakage in padding bytes.
     * Static compile-time size assertions (static_assert) guarantee wire format structure size.
@@ -57,7 +56,8 @@ static uint32_t targetSessionId = 0;  // Active boot session ID of TARGET_NODE_I
 static float kalman_x = 512.0f; // Estimated value
 static float kalman_p = 1.0f;    // Estimation error covariance
 
-// Sequence tracking
+// Sequence tracking & rate limiting
+static uint32_t lastTxTime = 0;
 static uint32_t messageSequence = 0;
 static uint32_t discoverySequence = 0;
 static uint32_t lastReceivedSeq = 0;
@@ -134,7 +134,6 @@ float readAnalogFiltered() {
     float averageAdc = (count > 0) ? (sum / (float)count) : (float)samples[0];
 
     // 4. Adaptive 1D Kalman Filter Update:
-    // Dynamic process noise Q scales with motion innovation to eliminate motion lag on step changes
     float innovation = fabsf(averageAdc - kalman_x);
     float dynamicQ = KALMAN_PROCESS_NOISE_Q;
     if (innovation > 10.0f) {
@@ -158,7 +157,7 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (Hardened Protocol)\n");
+    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (Strict Unicast Control)\n");
     Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | PWM Out: GPIO %d (D1)\n", PWM_PIN);
     Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
@@ -256,15 +255,20 @@ void sendHelloAck(uint32_t destMeshId) {
  * hex-encodes it, and sends CONTROL payload EXCLUSIVELY via targeted UNICAST (sendSingle).
  */
 void sendSensorData() {
-    float filteredVal = readAnalogFiltered();
-    uint16_t highResSensorVal = (uint16_t)constrain((int)roundf(filteredVal), 0, 1023);
-
-    uint8_t digitalVal = digitalRead(DIGITAL_INPUT_PIN);
-
     // Suppress CONTROL packet transmission unless CONNECTED to target node
     if (peerState != PeerState::CONNECTED || targetMeshNodeId == 0 || !mesh.isConnected(targetMeshNodeId)) {
         return;
     }
+
+    uint32_t now = millis();
+    if (lastTxTime != 0 && (now - lastTxTime < 200)) {
+        return; // Enforce minimum 200ms interval
+    }
+
+    float filteredVal = readAnalogFiltered();
+    uint16_t highResSensorVal = (uint16_t)constrain((int)roundf(filteredVal), 0, 1023);
+
+    uint8_t digitalVal = digitalRead(DIGITAL_INPUT_PIN);
 
     SensorMessage msg{}; // Zero-initialized struct
     msg.magic = MSG_TYPE_DATA;
@@ -281,6 +285,8 @@ void sendSensorData() {
         sprintf(&staticHexTxBuffer[i * 2], "%02X", rawBytes[i]);
     }
     staticHexTxBuffer[PAIR_WIRE_HEX_LEN] = '\0';
+
+    lastTxTime = now;
 
     // Strict Unicast CONTROL Transmission
     bool sentDirect = mesh.sendSingle(targetMeshNodeId, String(staticHexTxBuffer));
