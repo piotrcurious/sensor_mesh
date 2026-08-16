@@ -3,7 +3,7 @@
 An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring high-precision Digital Signal Processing (DSP) for analog inputs, directional limit switch protection, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
 
 1. **`esp8266_mesh_pair`**: PWM & Digital IO version (transmits 1/sec periodic updates).
-2. **`esp8266_mesh_servo`**: Servo version (5ms high-frequency input polling, 200ms network rate limiting, directional limit switch safety clamping, microsecond pulse control).
+2. **`esp8266_mesh_servo`**: Servo version (50ms input polling, 200ms network rate limiting, directional limit switch safety clamping, microsecond pulse control).
 
 Both versions allow creating paired ESP8266 nodes (configured with simple compile-time node IDs) that communicate bi-directionally over an ad-hoc Wi-Fi mesh network using compact hex-encoded binary packed structs.
 
@@ -13,7 +13,7 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 | Feature | `esp8266_mesh_pair` (PWM Version) | `esp8266_mesh_servo` (Servo Version) |
 |---|---|---|
-| **Input Polling Rate** | 1000 ms (1 Hz) | 5 ms (200 Hz high-frequency local sampling) |
+| **Input Polling Rate** | 1000 ms (1 Hz) | 50 ms (20 Hz local sampling, Wi-Fi PHY safe) |
 | **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Rate-limited (max 1 packet per 200 ms / 5 Hz) |
 | **Analog Input Processing** | Kahan Oversampling + Single Min/Max Outlier Rejection + 1D Kalman Filter | Kahan Oversampling + Single Min/Max Outlier Rejection + 1D Kalman Filter |
 | **Primary Actuator / Drive** | PWM Output on `D1` (GPIO 5, 0-1023) | Servo Motor via `writeMicroseconds()` on `D1` (544–2400 $\mu s$) |
@@ -26,6 +26,11 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ## 2. Directional Limit Switch Safety & Advanced DSP Pipeline
 
+### Wi-Fi PHY & Mesh Stability
+ESP8266 uses a shared multiplexed SAR ADC (`system_adc_read()`) that briefly pauses Wi-Fi radio reception during conversion. To ensure painlessMesh auto-discovery, AP/STA topology changes, and packet receptions function without RF dropouts:
+- ADC oversampling uses 4 samples per read cycle interleaved with `optimistic_yield()` calls to give time back to the ESP8266 Wi-Fi stack.
+- Input polling is scheduled at 50 ms (20 Hz) to allow seamless mesh network topology updates.
+
 ### Directional Limit Switch Safety Model (`esp8266_mesh_servo`)
 Rather than jumping to extreme pulse limits when a limit switch triggers (which can push the actuator into physical end-stops), the firmware enforces **directional motion protection**:
 - **MIN limit switch active (`D6`)**: Forbids further movement toward MIN (`targetUs < lastSafeUs`), holding `lastSafeUs`, while permitting movement toward MAX (`targetUs > lastSafeUs`).
@@ -36,10 +41,10 @@ Rather than jumping to extreme pulse limits when a limit switch triggers (which 
 To eliminate analog signal noise, ADC jitter, and floating-point accumulation drift while managing network bandwidth:
 
 1. **Kahan Summation Oversampling**:
-   - Takes 16 raw ADC samples per measurement cycle using the **Kahan Summation algorithm** to compensate for numerical floating-point precision loss.
+   - Takes 4 raw ADC samples per measurement cycle using the **Kahan Summation algorithm** to compensate for numerical floating-point precision loss.
 
 2. **Accurate Trimmed-Mean Outlier Rejection**:
-   - Subtracts exactly **one minimum** sample value and **one maximum** sample value from the accumulated sum and divides by 14 (16 - 2). This eliminates single-sample electrical spikes without biasing discrete ADC distributions.
+   - Subtracts exactly **one minimum** sample value and **one maximum** sample value from the accumulated sum and divides by 2 (4 - 2). This eliminates single-sample electrical spikes without biasing discrete ADC distributions.
 
 3. **1D Kalman Filtering**:
    - Passes the averaged oversampled reading through a 1-dimensional Kalman Filter (`Q = 0.05`, `R = 4.0`) to produce ultra-smooth continuous motion control.
@@ -147,7 +152,7 @@ arduino-cli upload -p /dev/ttyUSB0 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
 
 # Compile Node 2 (MY_NODE_ID=2, TARGET_NODE_ID=1)
 arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 \
-  --build-property "build.extra_flags=-DMY_NODE_ID=2 -DTARGET_NODE_ID=1" \
+  --build-property "build.extra_flags=-DMY_NODE_ID=2 -DTARGET_NODE_ID=2" \
   esp8266_mesh_servo
 
 # Upload to Node 2
@@ -164,7 +169,7 @@ arduino-cli upload -p /dev/ttyUSB1 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
 2. **Serial Monitor Logs (115200 baud)**:
    ```text
    ==================================================
-   ESP8266 Bi-directional Servo Mesh Node (Directional Safety & Fixed Trimmed Mean)
+   ESP8266 Bi-directional Servo Mesh Node (Wi-Fi PHY Safe)
    My Node ID: 1 -> Target Node ID: 2
    Analog In: A0 (DSP Kahan+Kalman) | Servo Pin: GPIO 5 (D1) [544 - 2400 us]
    Digital In: GPIO 4 (D2) | Digital Out: GPIO 0 (D3)

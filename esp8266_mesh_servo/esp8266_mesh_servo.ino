@@ -1,14 +1,15 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (High-Precision DSP & Directional Limit Safety)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (High-Precision DSP & Directional Safety)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Enhancements:
+  - Wi-Fi PHY & Mesh connection stability: ADC sampling is yield-friendly to avoid blocking Wi-Fi PHY interrupts.
   - Directional limit switch safety clamping:
     * MIN active: forbids further movement toward MIN (targetUs < lastSafeUs), allows movement toward MAX.
     * MAX active: forbids further movement toward MAX (targetUs > lastSafeUs), allows movement toward MIN.
     * Separates requestedServoUs from appliedServoUs / lastSafeUs.
   - Correct single min/max trimmed-mean outlier rejection with Kahan summation.
-  - High-frequency input polling (every 5 ms / 200 Hz) for immediate local motion update.
+  - Polled input reading (50 ms / 20 Hz) for immediate local motion update.
   - Rate-limited network transmissions (minimum 200 ms between mesh packet broadcasts).
   - 1D Kalman Filter for ultra-smooth analog readings.
   - High-precision Servo driving using myServo.writeMicroseconds().
@@ -32,7 +33,7 @@ void nodeTimeAdjustedCallback(int32_t offset);
 void updateLocalServoMicroseconds(uint16_t requestedUs);
 float readAnalogFiltered();
 
-// High-rate polling task (5 ms)
+// Input polling task (50 ms)
 Task taskPollInputs(POLL_INTERVAL_MS, TASK_FOREVER, &checkAndTransmitInputs);
 
 // Kalman Filter State
@@ -62,7 +63,7 @@ static uint8_t hexCharToNibble(char c) {
 
 /**
  * High-Precision Analog Read:
- * 1. Takes ADC_OVERSAMPLE_COUNT samples.
+ * 1. Takes ADC_OVERSAMPLE_COUNT samples with yields to ensure Wi-Fi PHY stability.
  * 2. Uses Kahan Summation algorithm to accumulate total without precision loss.
  * 3. Applies Outlier Rejection: subtracts exactly ONE minVal and ONE maxVal.
  * 4. Filters result through 1D Kalman Filter.
@@ -83,6 +84,8 @@ float readAnalogFiltered() {
         float t = sum + y;
         c = (t - sum) - y;
         sum = t;
+
+        optimistic_yield(1000); // Allow Wi-Fi stack & PHY tasks to process
     }
 
     // 2. Outlier Rejection: Subtract exactly ONE minVal and ONE maxVal
@@ -109,7 +112,7 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Directional Safety & Fixed Trimmed Mean)\n");
+    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Wi-Fi PHY Safe)\n");
     Serial.printf("My Node ID: %u -> Target Node ID: %u\n", MY_NODE_ID, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
                   SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
@@ -141,7 +144,7 @@ void setup() {
     mesh.onChangedConnections(&changedConnectionCallback);
     mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback);
 
-    // Add and enable high-rate polling task
+    // Add and enable polling task
     userScheduler.addTask(taskPollInputs);
     taskPollInputs.enable();
 }
@@ -152,8 +155,8 @@ void loop() {
 }
 
 /**
- * Polls inputs at high frequency (5 ms).
- * Updates local limit switch clamping immediately.
+ * Polls inputs at 50 ms intervals.
+ * Updates local limit switch safety clamping immediately.
  * Enforces MIN_TX_INTERVAL_MS (200 ms) rate limiting on mesh broadcast transmissions.
  */
 void checkAndTransmitInputs() {
@@ -170,7 +173,7 @@ void checkAndTransmitInputs() {
     uint8_t currentMinLimit = (digitalRead(MIN_LIMIT_PIN) == LOW) ? 1 : 0;
     uint8_t currentMaxLimit = (digitalRead(MAX_LIMIT_PIN) == LOW) ? 1 : 0;
 
-    // Local limit switch reaction (updates local servo safety clamping immediately every 5ms)
+    // Local limit switch reaction (updates local servo safety clamping immediately)
     if (currentMinLimit != lastMinLimit || currentMaxLimit != lastMaxLimit) {
         updateLocalServoMicroseconds(requestedServoUs);
     }

@@ -43,7 +43,7 @@ static uint8_t hexCharToNibble(char c) {
 
 /**
  * High-Precision Analog Read:
- * 1. Takes ADC_OVERSAMPLE_COUNT samples.
+ * 1. Takes ADC_OVERSAMPLE_COUNT samples with yields to protect Wi-Fi PHY tasks.
  * 2. Uses Kahan Summation algorithm to accumulate total without precision loss.
  * 3. Applies Outlier Rejection: subtracts exactly ONE minVal and ONE maxVal.
  * 4. Filters result through 1D Kalman Filter.
@@ -64,6 +64,8 @@ float readAnalogFiltered() {
         float t = sum + y;
         c = (t - sum) - y;
         sum = t;
+
+        optimistic_yield(1000); // Yield to Wi-Fi PHY layer
     }
 
     // 2. Outlier Rejection: Subtract exactly ONE minVal and ONE maxVal

@@ -56,8 +56,8 @@
 // Maximum interval between transmissions even if no state changes (heartbeat ms)
 #define HEARTBEAT_INTERVAL_MS 5000
 
-// High-rate input polling interval (5 ms = 200 Hz sampling)
-#define POLL_INTERVAL_MS 5
+// Polling interval (50 ms = 20 Hz sampling) for Wi-Fi stack stability
+#define POLL_INTERVAL_MS 50
 
 // Network rate limit: minimum time between mesh packet broadcasts (200 ms = 5 Hz max packet rate)
 #define MIN_TX_INTERVAL_MS 200
@@ -66,8 +66,8 @@
 // DSP & Precision Parameters (Oversampling, Kahan, Outlier, Kalman)
 // ============================================================================
 
-// Oversampling count per sample cycle
-#define ADC_OVERSAMPLE_COUNT 16
+// Oversampling count per sample cycle (4 samples to protect ESP8266 Wi-Fi PHY time-slicing)
+#define ADC_OVERSAMPLE_COUNT 4
 
 // Kalman Filter Tuning Parameters
 #define KALMAN_PROCESS_NOISE_Q 0.05f
