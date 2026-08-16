@@ -1,5 +1,5 @@
 /*
-  ESP8266 Bi-directional Sensor Mesh Node Firmware (Hardened PeerSession Tuple Validation)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Hardened PeerSession Tuple Validation)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Hardening Enhancements:
@@ -15,30 +15,35 @@
     * DATA packets with invalid session_id, unverified transport node ID, or stale seq are DROPPED.
   - Fast Local Lookup Table (LUT) Hex Encoder / Decoder & CRC-16 Checksum.
   - Zero Heap Allocation Strategy (static reserved txPayloadString).
+  - Sub-microsecond Fixed-Point Precision (FP4 = 1/16th us resolution).
+  - Directional limit switch safety clamping.
 */
 
 #include <painlessMesh.h>
+#include <Servo.h>
 #include "config.h"
 
-// TaskScheduler and painlessMesh instance
+// TaskScheduler, painlessMesh, and Servo instances
 Scheduler userScheduler;
 painlessMesh mesh;
+Servo myServo;
 
 // Function declarations
-void sendSensorData();
+void checkAndTransmitInputs();
 void sendHelloDiscovery();
 void receivedCallback(uint32_t from, String &msg);
 void newConnectionCallback(uint32_t nodeId);
 void changedConnectionCallback();
 void nodeTimeAdjustedCallback(int32_t offset);
+void updateLocalServoFp4(uint16_t requestedUsFp4);
 float readAnalogFiltered();
 bool isNewerSequence(uint32_t incoming, uint32_t last, bool initialized);
 
 // Fast Hex LUT
 static const char HEX_LUT[] = "0123456789ABCDEF";
 
-// Task to read sensor and transmit data every 1 second (SEND_INTERVAL_MS)
-Task taskSendSensorData(SEND_INTERVAL_MS, TASK_FOREVER, &sendSensorData);
+// Input polling task (50 ms)
+Task taskPollInputs(POLL_INTERVAL_MS, TASK_FOREVER, &checkAndTransmitInputs);
 
 // Discovery task (1000 ms retry while DISCOVERING)
 Task taskDiscovery(DISCOVERY_INTERVAL_MS, TASK_FOREVER, &sendHelloDiscovery);
@@ -61,16 +66,25 @@ struct PeerSession {
 static PeerSession peerSession{};
 
 // Kalman Filter State
-static float kalman_x = 512.0f; // Estimated value
-static float kalman_p = 1.0f;    // Estimation error covariance
+static float kalman_x = 512.0f;
+static float kalman_p = 1.0f;
 
-// Sequence tracking
+// State tracking for change detection & network rate limiting
+static uint16_t lastTransmittedUsFp4 = 0xFFFF;
+static uint8_t  lastDigitalVal = 0xFF;
+static uint8_t  lastMinLimit = 0xFF;
+static uint8_t  lastMaxLimit = 0xFF;
+static uint32_t lastTxTime = 0;
 static uint32_t messageSequence = 0;
 static uint32_t discoverySequence = 0;
-static uint32_t lastTxTime = 0;
+
+// Motion control state separation in fixed-point 1/16th microseconds (FP4)
+static uint16_t requestedServoUsFp4 = 23552; // 1472 us * 16
+static uint16_t appliedServoUsFp4   = 23552;
+static uint16_t lastSafeUsFp4       = 23552;
 
 // Reusable static character buffer & static reserved String payload
-static char staticHexTxBuffer[PAIR_WIRE_HEX_LEN + 1];
+static char staticHexTxBuffer[SERVO_WIRE_HEX_LEN + 1];
 static String txPayloadString;
 
 /**
@@ -199,7 +213,7 @@ void setup() {
     mySessionId = ESP.getChipId() ^ micros() ^ ESP.getCycleCount() ^ (uint32_t)random(0xFFFFFFFF);
 
     // Pre-reserve static txPayloadString capacity to prevent heap allocations
-    txPayloadString.reserve(PAIR_WIRE_HEX_LEN + 1);
+    txPayloadString.reserve(SERVO_WIRE_HEX_LEN + 1);
 
     // Initialize peerSession state
     peerSession.senderId = TARGET_NODE_ID;
@@ -213,23 +227,29 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (PeerSession Tuple Validated)\n");
+    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (PeerSession Tuple Validated)\n");
     Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
-    Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | PWM Out: GPIO %d (D1)\n", PWM_PIN);
+    Serial.printf("Analog In: A0 (Adaptive Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
+                  SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
     Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
+    Serial.printf("Min Limit Pin: GPIO %d (D6) | Max Limit Pin: GPIO %d (D7)\n", MIN_LIMIT_PIN, MAX_LIMIT_PIN);
     Serial.println("==================================================");
 
     // Initialize hardware pins
     pinMode(SENSOR_PIN, INPUT);
-    pinMode(PWM_PIN, OUTPUT);
-    analogWrite(PWM_PIN, 0);
-
     pinMode(DIGITAL_INPUT_PIN, INPUT_PULLUP);
     pinMode(DIGITAL_OUTPUT_PIN, OUTPUT);
     digitalWrite(DIGITAL_OUTPUT_PIN, LOW);
 
+    pinMode(MIN_LIMIT_PIN, INPUT_PULLUP);
+    pinMode(MAX_LIMIT_PIN, INPUT_PULLUP);
+
     // Initialize Kalman state
     kalman_x = (float)analogRead(SENSOR_PIN);
+
+    // Attach Servo with calibrated pulse width range
+    myServo.attach(SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
+    updateLocalServoFp4(requestedServoUsFp4);
 
     // Initialize painlessMesh network
     mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
@@ -239,8 +259,8 @@ void setup() {
     mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback);
 
     // Enable Tasks
-    userScheduler.addTask(taskSendSensorData);
-    taskSendSensorData.enable();
+    userScheduler.addTask(taskPollInputs);
+    taskPollInputs.enable();
 
     userScheduler.addTask(taskDiscovery);
     taskDiscovery.enable();
@@ -292,7 +312,6 @@ void sendHelloAck(uint32_t destMeshId) {
     bytesToHex((const uint8_t*)&ackMsg, sizeof(HandshakeMessage), staticHexTxBuffer);
 
     txPayloadString = staticHexTxBuffer;
-
     mesh.sendSingle(destMeshId, txPayloadString);
 
     Serial.printf("[DISCOVERY #%u] Sent targeted HELLO_ACK to Target Node %u (MeshID: %u, Session: %u)\n",
@@ -300,45 +319,118 @@ void sendHelloAck(uint32_t destMeshId) {
 }
 
 /**
- * Reads DSP-filtered analog input and digital input, packs into binary struct,
- * hex-encodes it, and sends CONTROL payload EXCLUSIVELY via targeted UNICAST (sendSingle).
+ * Polls inputs at 50 ms intervals.
+ * Transmits CONTROL payloads EXCLUSIVELY via targeted UNICAST (sendSingle) with a strict MIN_TX_INTERVAL_MS rate limit.
  */
-void sendSensorData() {
+void checkAndTransmitInputs() {
+    float filteredAdc = readAnalogFiltered();
+
+    float targetPulseUs = (float)SERVO_MIN_PULSE_WIDTH + (filteredAdc / 1023.0f) * (float)(SERVO_MAX_PULSE_WIDTH - SERVO_MIN_PULSE_WIDTH);
+    float targetPulseFp4Float = targetPulseUs * 16.0f;
+
+    uint16_t minUsFp4 = SERVO_MIN_PULSE_WIDTH * 16;
+    uint16_t maxUsFp4 = SERVO_MAX_PULSE_WIDTH * 16;
+
+    uint16_t currentUsFp4 = (uint16_t)constrain((int)roundf(targetPulseFp4Float), minUsFp4, maxUsFp4);
+
+    uint8_t currentDigital = digitalRead(DIGITAL_INPUT_PIN);
+    uint8_t currentMinLimit = (digitalRead(MIN_LIMIT_PIN) == LOW) ? 1 : 0;
+    uint8_t currentMaxLimit = (digitalRead(MAX_LIMIT_PIN) == LOW) ? 1 : 0;
+
+    // Local limit switch reaction
+    static uint8_t lastLocalMinLimit = 0xFF;
+    static uint8_t lastLocalMaxLimit = 0xFF;
+    if (currentMinLimit != lastLocalMinLimit || currentMaxLimit != lastLocalMaxLimit) {
+        lastLocalMinLimit = currentMinLimit;
+        lastLocalMaxLimit = currentMaxLimit;
+        updateLocalServoFp4(requestedServoUsFp4);
+    }
+
+    // Suppress CONTROL packet transmission unless CONNECTED to target node
     if (peerSession.state != PeerState::CONNECTED || peerSession.meshNodeId == 0 || !mesh.isConnected(peerSession.meshNodeId)) {
         return;
     }
 
+    // STRICT NETWORK RATE-LIMITING GATE
     uint32_t now = millis();
-    if (lastTxTime != 0 && (now - lastTxTime < 200)) {
+    if (lastTxTime != 0 && (now - lastTxTime < MIN_TX_INTERVAL_MS)) {
         return;
     }
 
-    float filteredVal = readAnalogFiltered();
-    uint16_t highResSensorVal = (uint16_t)constrain((int)roundf(filteredVal), 0, 1023);
+    bool pulseChanged = (abs((int)currentUsFp4 - (int)lastTransmittedUsFp4) >= PULSE_FP4_CHANGE_THRESHOLD);
+    bool digitalChanged = (currentDigital != lastDigitalVal);
+    bool minLimitChanged = (currentMinLimit != lastMinLimit);
+    bool maxLimitChanged = (currentMaxLimit != lastMaxLimit);
+    bool stateChanged = (pulseChanged || digitalChanged || minLimitChanged || maxLimitChanged);
 
-    uint8_t digitalVal = digitalRead(DIGITAL_INPUT_PIN);
+    bool heartbeatElapsed = (now - lastTxTime >= HEARTBEAT_INTERVAL_MS);
 
-    SensorMessage msg{}; // Zero-initialized struct
-    msg.magic = MSG_TYPE_DATA;
-    msg.sender_id = MY_NODE_ID;
-    msg.target_id = TARGET_NODE_ID;
-    msg.session_id = mySessionId;
-    msg.sensor_value = highResSensorVal;
-    msg.digital_value = digitalVal;
-    msg.seq = ++messageSequence;
+    if (stateChanged || heartbeatElapsed) {
+        ServoMeshMessage msg{}; // Zero-initialized struct
+        msg.magic = MSG_TYPE_DATA;
+        msg.sender_id = MY_NODE_ID;
+        msg.target_id = TARGET_NODE_ID;
+        msg.session_id = mySessionId;
+        msg.target_us_fp4 = currentUsFp4;
+        msg.digital_value = currentDigital;
+        msg.min_limit_active = currentMinLimit;
+        msg.max_limit_active = currentMaxLimit;
+        msg.seq = ++messageSequence;
 
-    msg.crc16 = calculateCRC16((const uint8_t*)&msg, sizeof(SensorMessage) - sizeof(uint16_t));
+        msg.crc16 = calculateCRC16((const uint8_t*)&msg, sizeof(ServoMeshMessage) - sizeof(uint16_t));
 
-    bytesToHex((const uint8_t*)&msg, sizeof(SensorMessage), staticHexTxBuffer);
+        bytesToHex((const uint8_t*)&msg, sizeof(ServoMeshMessage), staticHexTxBuffer);
 
-    lastTxTime = now;
-    txPayloadString = staticHexTxBuffer;
+        lastTxTime = now;
+        txPayloadString = staticHexTxBuffer;
 
-    bool sentDirect = mesh.sendSingle(peerSession.meshNodeId, txPayloadString);
+        // Strict Unicast CONTROL Transmission
+        bool sentDirect = mesh.sendSingle(peerSession.meshNodeId, txPayloadString);
 
-    Serial.printf("[TX #%u] Filtered ADC: %.2f (Val: %u) | Digital D2: %u | Unicast Queued: %s (CRC: 0x%04X)\n",
-                  msg.seq, filteredVal, highResSensorVal, digitalVal,
-                  sentDirect ? "SUCCESS" : "FAILED", msg.crc16);
+        if (sentDirect) {
+            lastTransmittedUsFp4 = currentUsFp4;
+            lastDigitalVal = currentDigital;
+            lastMinLimit = currentMinLimit;
+            lastMaxLimit = currentMaxLimit;
+        }
+
+        Serial.printf("[TX #%u] Filtered ADC: %.2f | Target Pulse: %.2f us (FP4: %u) | Unicast Queued: %s (CRC: 0x%04X)\n",
+                      msg.seq, filteredAdc, (float)currentUsFp4 / 16.0f, currentUsFp4,
+                      sentDirect ? "SUCCESS" : "FAILED", msg.crc16);
+    }
+}
+
+/**
+ * Calculates and updates local servo pulse width with FP4 sub-microsecond precision & directional limit clamping.
+ */
+void updateLocalServoFp4(uint16_t newRequestedUsFp4) {
+    requestedServoUsFp4 = newRequestedUsFp4;
+
+    uint16_t minUsFp4 = SERVO_MIN_PULSE_WIDTH * 16;
+    uint16_t maxUsFp4 = SERVO_MAX_PULSE_WIDTH * 16;
+
+    uint16_t targetUsFp4 = constrain(requestedServoUsFp4, minUsFp4, maxUsFp4);
+
+    bool minActive = (digitalRead(MIN_LIMIT_PIN) == LOW);
+    bool maxActive = (digitalRead(MAX_LIMIT_PIN) == LOW);
+
+    if (minActive && targetUsFp4 < lastSafeUsFp4) {
+        targetUsFp4 = lastSafeUsFp4;
+    }
+
+    if (maxActive && targetUsFp4 > lastSafeUsFp4) {
+        targetUsFp4 = lastSafeUsFp4;
+    }
+
+    uint16_t targetUsInt = (uint16_t)roundf((float)targetUsFp4 / 16.0f);
+
+    myServo.writeMicroseconds(targetUsInt);
+
+    appliedServoUsFp4 = targetUsFp4;
+    lastSafeUsFp4 = targetUsFp4;
+
+    Serial.printf("[SERVO FP4] Requested: %.2f us -> Applied: %u us (%u FP4) | LastSafe: %u FP4 (MinLim: %d, MaxLim: %d)\n",
+                  (float)requestedServoUsFp4 / 16.0f, targetUsInt, appliedServoUsFp4, lastSafeUsFp4, minActive, maxActive);
 }
 
 /**
@@ -353,6 +445,7 @@ void receivedCallback(uint32_t from, String &msg) {
             return;
         }
 
+        // Verify CRC16 Checksum
         uint16_t expectedCrc = calculateCRC16((const uint8_t*)&handshake, sizeof(HandshakeMessage) - sizeof(uint16_t));
         if (handshake.crc16 != expectedCrc) {
             Serial.printf("[RX CRC REJECT] Handshake CRC mismatch: received 0x%04X, expected 0x%04X\n",
@@ -383,6 +476,7 @@ void receivedCallback(uint32_t from, String &msg) {
                     }
                     sendHelloAck(from);
                 } else {
+                    // Duplicate/Old HELLO inside current session -> reply ACK but DO NOT reset DATA sequence!
                     Serial.printf("[HANDSHAKE] Duplicate HELLO (Session: %u, HelloSeq: %u). Sending ACK without DATA seq reset.\n",
                                   handshake.session_id, handshake.seq);
                     sendHelloAck(from);
@@ -408,26 +502,29 @@ void receivedCallback(uint32_t from, String &msg) {
     }
 
     // 2. Check for Data Payload Messages
-    if (msg.length() != PAIR_WIRE_HEX_LEN) {
+    if (msg.length() != SERVO_WIRE_HEX_LEN) {
         return;
     }
 
+    // TUPLE VALIDATION RULE 1: Must be in CONNECTED state
     if (peerSession.state != PeerState::CONNECTED) {
         return;
     }
 
+    // TUPLE VALIDATION RULE 2: Must originate from active peerSession.meshNodeId
     if (from != peerSession.meshNodeId) {
         Serial.printf("[RX REJECT] DATA payload from unverified MeshID %u (Active Target MeshID: %u)\n",
                       from, peerSession.meshNodeId);
         return;
     }
 
-    SensorMessage incoming{};
-    if (!hexToBytes(msg, (uint8_t*)&incoming, sizeof(SensorMessage))) {
+    ServoMeshMessage incoming{};
+    if (!hexToBytes(msg, (uint8_t*)&incoming, sizeof(ServoMeshMessage))) {
         return;
     }
 
-    uint16_t expectedCrc = calculateCRC16((const uint8_t*)&incoming, sizeof(SensorMessage) - sizeof(uint16_t));
+    // Verify CRC16 Checksum
+    uint16_t expectedCrc = calculateCRC16((const uint8_t*)&incoming, sizeof(ServoMeshMessage) - sizeof(uint16_t));
     if (incoming.crc16 != expectedCrc) {
         Serial.printf("[RX CRC REJECT] Data Payload CRC mismatch: received 0x%04X, expected 0x%04X\n",
                       incoming.crc16, expectedCrc);
@@ -438,18 +535,22 @@ void receivedCallback(uint32_t from, String &msg) {
         return;
     }
 
+    // TUPLE VALIDATION RULE 3: Explicit Sender & Target Validation
     if (incoming.sender_id != TARGET_NODE_ID || incoming.target_id != MY_NODE_ID) {
         return;
     }
 
+    // TUPLE VALIDATION RULE 4: Strict Active Session ID Matching
+    // DATA payloads CANNOT establish or reset sessions. Stale or unauthenticated session IDs are DROPPED.
     if (incoming.session_id != peerSession.sessionId) {
         Serial.printf("[RX SESSION REJECT] Dropped DATA with stale/unmatched Session ID %u (Active Session: %u)\n",
                       incoming.session_id, peerSession.sessionId);
         return;
     }
 
+    // TUPLE VALIDATION RULE 5: Sequence Check for active session
     if (!isNewerSequence(incoming.seq, peerSession.lastDataSeq, peerSession.hasDataSeq)) {
-        Serial.printf("[RX DROP #%u] Out-of-order or duplicate DATA packet dropped (Last Seq: %u, Sender Session: %u)\n",
+        Serial.printf("[RX DROP #%u] Out-of-order or duplicate DATA packet dropped (Last Seq: %u, Session: %u)\n",
                       incoming.seq, peerSession.lastDataSeq, incoming.session_id);
         return;
     }
@@ -457,24 +558,25 @@ void receivedCallback(uint32_t from, String &msg) {
     peerSession.lastDataSeq = incoming.seq;
     peerSession.hasDataSeq = true;
 
-    uint16_t pwmValue = incoming.sensor_value;
-    if (pwmValue > PWM_RANGE) {
-        pwmValue = PWM_RANGE;
-    }
+    // Update local digital output (D3)
+    digitalWrite(DIGITAL_OUTPUT_PIN, incoming.digital_value ? HIGH : LOW);
 
-    analogWrite(PWM_PIN, pwmValue);
+    // Update local servo
+    updateLocalServoFp4(incoming.target_us_fp4);
 
-    uint8_t digitalState = incoming.digital_value ? HIGH : LOW;
-    digitalWrite(DIGITAL_OUTPUT_PIN, digitalState);
-
-    Serial.printf("[RX #%u] From Node: %u (Session: %u) | Analog: %u -> PWM Duty: %u/%d | Digital D2 -> D3: %u (Mesh NodeID: %u)\n",
-                  incoming.seq, incoming.sender_id, incoming.session_id, incoming.sensor_value, pwmValue, PWM_RANGE, digitalState, from);
+    Serial.printf("[RX #%u] From Node: %u (Session: %u) | Target Pulse: %.2f us (%u FP4) | Digital: %u | MinLim: %u | MaxLim: %u\n",
+                  incoming.seq, incoming.sender_id, incoming.session_id, (float)incoming.target_us_fp4 / 16.0f,
+                  incoming.target_us_fp4, incoming.digital_value, incoming.min_limit_active, incoming.max_limit_active);
 }
 
 void newConnectionCallback(uint32_t nodeId) {
     Serial.printf("[MESH] New Connection, nodeId = %u (Local Mesh Node ID = %u)\n", nodeId, mesh.getNodeId());
 }
 
+/**
+ * Handles topology changes: verifies if peerSession.meshNodeId is still present in current node list.
+ * If disconnected, resets peerSession.meshNodeId and transitions peerSession.state to DISCOVERING.
+ */
 void changedConnectionCallback() {
     Serial.printf("[MESH] Topology changed (Local Mesh Node ID = %u)\n", mesh.getNodeId());
 
