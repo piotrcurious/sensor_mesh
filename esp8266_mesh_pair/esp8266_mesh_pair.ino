@@ -1,29 +1,22 @@
 /*
-  ESP8266 Bi-directional Sensor Mesh Node Firmware (Handshake-Only Sessions & Heap Optimized)
+  ESP8266 Bi-directional Sensor Mesh Node Firmware (Fast LUT Hex & CRC16 Hardened)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Hardening Enhancements:
+  - Fast Local Lookup Table (LUT) Hex Encoder / Decoder:
+    * Replaces slow sprintf formatting with an ultra-fast local lookup table (HEX_LUT[]) encoder (bytesToHex).
+    * Fast, robust nibble decoder (hexToBytes).
+  - CRC-16-CCITT Checksum Verification:
+    * Calculates 16-bit CRC-16 over all header and payload bytes prior to transmission.
+    * Receivers recompute and verify the CRC-16 checksum, dropping corrupted packets immediately.
   - Strict Handshake-Only Session Installation:
     * DATA packets are NEVER permitted to establish or reset a session.
-    * DATA packets must strictly match active targetSessionId. Stale, unauthenticated, or mismatched
-      session DATA packets are immediately DROPPED.
-    * Sessions are installed EXCLUSIVELY via MSG_TYPE_HELLO / MSG_TYPE_HELLO_ACK handshakes.
   - Zero Heap Allocation Strategy:
-    * Uses a static reusable String txPayloadString with pre-reserved capacity (reserve()),
-      preventing repeated creation/destruction of String objects on the ESP8266 heap.
-  - Hardened Boot Nonce Generation:
-    * Combines ESP.getChipId(), micros(), ESP.getCycleCount(), and random() for boot incarnation.
-  - Strict Rate Limiting Gate:
-    * Enforces a hard time gate (now - lastTxTime < MIN_TX_INTERVAL_MS) at the start of packet evaluation.
+    * Uses a static reusable String txPayloadString with pre-reserved capacity (reserve()).
   - Adaptive 1D Kalman Filter:
     * Dynamic process noise Q scales with motion innovation, eliminating motion lag.
-  - Protocol Integrity & Zero-Initialization:
-    * Zero-initializes all C++ structs (Struct{}) to prevent stack garbage leakage in padding bytes.
-    * Static compile-time size assertions (static_assert) guarantee wire format structure size.
-  - Strict Transport Route Validation:
-    * Once CONNECTED, data payloads are accepted ONLY if from == targetMeshNodeId.
-  - Targeted Unicast Handshakes:
-    * HELLO_ACK is sent strictly via unicast; targeted ACKs do NOT fall back to broadcast.
+  - Strict Rate Limiting Gate:
+    * Enforces a hard time gate (now - lastTxTime < MIN_TX_INTERVAL_MS).
 */
 
 #include <painlessMesh.h>
@@ -42,6 +35,9 @@ void changedConnectionCallback();
 void nodeTimeAdjustedCallback(int32_t offset);
 float readAnalogFiltered();
 bool isNewerSequence(uint32_t incoming, uint32_t last);
+
+// Fast Hex LUT
+static const char HEX_LUT[] = "0123456789ABCDEF";
 
 // Task to read sensor and transmit data every 1 second (SEND_INTERVAL_MS)
 Task taskSendSensorData(SEND_INTERVAL_MS, TASK_FOREVER, &sendSensorData);
@@ -66,17 +62,68 @@ static uint32_t messageSequence = 0;
 static uint32_t discoverySequence = 0;
 static uint32_t lastReceivedSeq = 0;
 static bool     hasReceivedFirstPacket = false;
+static uint32_t lastTxTime = 0;
 
-// Reusable static character buffer & static reserved String payload to prevent heap fragmentation
+// Reusable static character buffer & static reserved String payload
 static char staticHexTxBuffer[PAIR_WIRE_HEX_LEN + 1];
 static String txPayloadString;
 
-// Helper: Convert uint8_t hex character to byte
-static uint8_t hexCharToNibble(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return 0;
+/**
+ * Calculates 16-bit CRC-16-CCITT checksum over byte array.
+ */
+uint16_t calculateCRC16(const uint8_t* data, size_t length) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < length; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            if (crc & 0x8000) {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+/**
+ * Fast LUT-based binary-to-hex encoder.
+ */
+void bytesToHex(const uint8_t* src, size_t srcLen, char* dest) {
+    for (size_t i = 0; i < srcLen; i++) {
+        uint8_t byte = src[i];
+        dest[i * 2]     = HEX_LUT[(byte >> 4) & 0x0F];
+        dest[i * 2 + 1] = HEX_LUT[byte & 0x0F];
+    }
+    dest[srcLen * 2] = '\0';
+}
+
+/**
+ * Fast robust hex-to-binary decoder.
+ */
+bool hexToBytes(const String& hexStr, uint8_t* dest, size_t destLen) {
+    if (hexStr.length() != destLen * 2) {
+        return false;
+    }
+    for (size_t i = 0; i < destLen; i++) {
+        char high = hexStr.charAt(i * 2);
+        char low  = hexStr.charAt(i * 2 + 1);
+
+        uint8_t highNibble = 0, lowNibble = 0;
+
+        if (high >= '0' && high <= '9') highNibble = high - '0';
+        else if (high >= 'A' && high <= 'F') highNibble = high - 'A' + 10;
+        else if (high >= 'a' && high <= 'f') highNibble = high - 'a' + 10;
+        else return false;
+
+        if (low >= '0' && low <= '9') lowNibble = low - '0';
+        else if (low >= 'A' && low <= 'F') lowNibble = low - 'A' + 10;
+        else if (low >= 'a' && low <= 'f') lowNibble = low - 'a' + 10;
+        else return false;
+
+        dest[i] = (highNibble << 4) | lowNibble;
+    }
+    return true;
 }
 
 /**
@@ -105,13 +152,11 @@ static void resetSessionSequence(uint32_t newSessionId) {
 float readAnalogFiltered() {
     uint16_t samples[ADC_OVERSAMPLE_COUNT];
 
-    // 1. Oversample ADC
     for (size_t i = 0; i < ADC_OVERSAMPLE_COUNT; i++) {
         samples[i] = analogRead(SENSOR_PIN);
         optimistic_yield(1000);
     }
 
-    // 2. Sort samples in place to cleanly strip highest and lowest extremes
     for (size_t i = 0; i < ADC_OVERSAMPLE_COUNT - 1; i++) {
         for (size_t j = i + 1; j < ADC_OVERSAMPLE_COUNT; j++) {
             if (samples[i] > samples[j]) {
@@ -122,7 +167,6 @@ float readAnalogFiltered() {
         }
     }
 
-    // 3. Kahan Summation on interior trimmed samples
     float sum = 0.0f;
     float c = 0.0f;
     size_t startIndex = (ADC_OVERSAMPLE_COUNT >= 4) ? 1 : 0;
@@ -138,7 +182,6 @@ float readAnalogFiltered() {
 
     float averageAdc = (count > 0) ? (sum / (float)count) : (float)samples[0];
 
-    // 4. Adaptive 1D Kalman Filter Update:
     float innovation = fabsf(averageAdc - kalman_x);
     float dynamicQ = KALMAN_PROCESS_NOISE_Q;
     if (innovation > 10.0f) {
@@ -165,7 +208,7 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (Handshake-Only Sessions)\n");
+    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (Fast LUT & CRC16)\n");
     Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | PWM Out: GPIO %d (D1)\n", PWM_PIN);
     Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
@@ -220,18 +263,16 @@ void sendHelloDiscovery() {
     helloMsg.session_id = mySessionId;
     helloMsg.seq = ++discoverySequence;
 
-    const uint8_t* rawBytes = (const uint8_t*)&helloMsg;
+    // Calculate CRC16 excluding crc16 field
+    helloMsg.crc16 = calculateCRC16((const uint8_t*)&helloMsg, sizeof(HandshakeMessage) - sizeof(uint16_t));
 
-    for (size_t i = 0; i < sizeof(HandshakeMessage); i++) {
-        sprintf(&staticHexTxBuffer[i * 2], "%02X", rawBytes[i]);
-    }
-    staticHexTxBuffer[HANDSHAKE_WIRE_HEX_LEN] = '\0';
+    bytesToHex((const uint8_t*)&helloMsg, sizeof(HandshakeMessage), staticHexTxBuffer);
 
     txPayloadString = staticHexTxBuffer;
     mesh.sendBroadcast(txPayloadString);
 
-    Serial.printf("[DISCOVERY #%u] Sent HELLO broadcast for Target Node %u (Session: %u)\n",
-                  helloMsg.seq, TARGET_NODE_ID, mySessionId);
+    Serial.printf("[DISCOVERY #%u] Sent HELLO broadcast for Target Node %u (Session: %u, CRC: 0x%04X)\n",
+                  helloMsg.seq, TARGET_NODE_ID, mySessionId, helloMsg.crc16);
 }
 
 /**
@@ -245,20 +286,18 @@ void sendHelloAck(uint32_t destMeshId) {
     ackMsg.session_id = mySessionId;
     ackMsg.seq = ++discoverySequence;
 
-    const uint8_t* rawBytes = (const uint8_t*)&ackMsg;
+    // Calculate CRC16 excluding crc16 field
+    ackMsg.crc16 = calculateCRC16((const uint8_t*)&ackMsg, sizeof(HandshakeMessage) - sizeof(uint16_t));
 
-    for (size_t i = 0; i < sizeof(HandshakeMessage); i++) {
-        sprintf(&staticHexTxBuffer[i * 2], "%02X", rawBytes[i]);
-    }
-    staticHexTxBuffer[HANDSHAKE_WIRE_HEX_LEN] = '\0';
+    bytesToHex((const uint8_t*)&ackMsg, sizeof(HandshakeMessage), staticHexTxBuffer);
 
     txPayloadString = staticHexTxBuffer;
 
     // Strict Unicast - no broadcast fallback for targeted ACKs
     mesh.sendSingle(destMeshId, txPayloadString);
 
-    Serial.printf("[DISCOVERY #%u] Sent targeted HELLO_ACK to Target Node %u (MeshID: %u, Session: %u)\n",
-                  ackMsg.seq, TARGET_NODE_ID, destMeshId, mySessionId);
+    Serial.printf("[DISCOVERY #%u] Sent targeted HELLO_ACK to Target Node %u (MeshID: %u, Session: %u, CRC: 0x%04X)\n",
+                  ackMsg.seq, TARGET_NODE_ID, destMeshId, mySessionId, ackMsg.crc16);
 }
 
 /**
@@ -269,6 +308,11 @@ void sendSensorData() {
     // Suppress CONTROL packet transmission unless CONNECTED to target node
     if (peerState != PeerState::CONNECTED || targetMeshNodeId == 0 || !mesh.isConnected(targetMeshNodeId)) {
         return;
+    }
+
+    uint32_t now = millis();
+    if (lastTxTime != 0 && (now - lastTxTime < 200)) {
+        return; // Enforce minimum 200ms interval
     }
 
     float filteredVal = readAnalogFiltered();
@@ -285,36 +329,40 @@ void sendSensorData() {
     msg.digital_value = digitalVal;
     msg.seq = ++messageSequence;
 
-    const uint8_t* rawBytes = (const uint8_t*)&msg;
+    // Calculate CRC16
+    msg.crc16 = calculateCRC16((const uint8_t*)&msg, sizeof(SensorMessage) - sizeof(uint16_t));
 
-    for (size_t i = 0; i < sizeof(SensorMessage); i++) {
-        sprintf(&staticHexTxBuffer[i * 2], "%02X", rawBytes[i]);
-    }
-    staticHexTxBuffer[PAIR_WIRE_HEX_LEN] = '\0';
+    bytesToHex((const uint8_t*)&msg, sizeof(SensorMessage), staticHexTxBuffer);
 
+    lastTxTime = now;
     txPayloadString = staticHexTxBuffer;
 
     // Strict Unicast CONTROL Transmission
     bool sentDirect = mesh.sendSingle(targetMeshNodeId, txPayloadString);
 
-    Serial.printf("[TX #%u] Filtered ADC: %.2f (Val: %u) | Digital D2: %u | Unicast Queued: %s (Session: %u)\n",
+    Serial.printf("[TX #%u] Filtered ADC: %.2f (Val: %u) | Digital D2: %u | Unicast Queued: %s (CRC: 0x%04X)\n",
                   msg.seq, filteredVal, highResSensorVal, digitalVal,
-                  sentDirect ? "SUCCESS" : "FAILED", mySessionId);
+                  sentDirect ? "SUCCESS" : "FAILED", msg.crc16);
 }
 
 /**
  * Callback when a mesh message is received.
- * Strict Session Integrity: DATA messages NEVER establish sessions. Handshakes install sessions exclusively.
+ * Strict Session Integrity, CRC-16 Checksum Validation, and Route Validation.
  */
 void receivedCallback(uint32_t from, String &msg) {
-    // 1. Check for Handshake Messages (HELLO / HELLO_ACK) - EXCLUSIVE session installation mechanism
+    // 1. Check for Handshake Messages (HELLO / HELLO_ACK)
     if (msg.length() == HANDSHAKE_WIRE_HEX_LEN) {
         HandshakeMessage handshake{};
-        uint8_t* rawBytes = (uint8_t*)&handshake;
-        for (size_t i = 0; i < sizeof(HandshakeMessage); i++) {
-            char highNibble = msg.charAt(i * 2);
-            char lowNibble = msg.charAt(i * 2 + 1);
-            rawBytes[i] = (hexCharToNibble(highNibble) << 4) | hexCharToNibble(lowNibble);
+        if (!hexToBytes(msg, (uint8_t*)&handshake, sizeof(HandshakeMessage))) {
+            return;
+        }
+
+        // Verify CRC16 Checksum
+        uint16_t expectedCrc = calculateCRC16((const uint8_t*)&handshake, sizeof(HandshakeMessage) - sizeof(uint16_t));
+        if (handshake.crc16 != expectedCrc) {
+            Serial.printf("[RX CRC REJECT] Handshake CRC mismatch: received 0x%04X, expected 0x%04X\n",
+                          handshake.crc16, expectedCrc);
+            return;
         }
 
         if (handshake.sender_id == TARGET_NODE_ID && handshake.target_id == MY_NODE_ID) {
@@ -338,48 +386,46 @@ void receivedCallback(uint32_t from, String &msg) {
 
     // 2. Check for Data Payload Messages
     if (msg.length() != PAIR_WIRE_HEX_LEN) {
-        return; // Size mismatch
+        return;
     }
 
-    // HARDENED FILTERING RULE 1: Must be in CONNECTED state
     if (peerState != PeerState::CONNECTED) {
         return;
     }
 
-    // HARDENED FILTERING RULE 2: Must originate from active targetMeshNodeId
     if (from != targetMeshNodeId) {
-        Serial.printf("[RX REJECT] DATA payload from unverified MeshID %u (Active Target MeshID: %u)\n",
+        Serial.printf("[RX ROUTE REJECT] Ignored DATA payload from unverified MeshID %u (Active Target MeshID: %u)\n",
                       from, targetMeshNodeId);
         return;
     }
 
     SensorMessage incoming{};
-    uint8_t* rawBytes = (uint8_t*)&incoming;
+    if (!hexToBytes(msg, (uint8_t*)&incoming, sizeof(SensorMessage))) {
+        return;
+    }
 
-    for (size_t i = 0; i < sizeof(SensorMessage); i++) {
-        char highNibble = msg.charAt(i * 2);
-        char lowNibble = msg.charAt(i * 2 + 1);
-        rawBytes[i] = (hexCharToNibble(highNibble) << 4) | hexCharToNibble(lowNibble);
+    // Verify CRC16 Checksum
+    uint16_t expectedCrc = calculateCRC16((const uint8_t*)&incoming, sizeof(SensorMessage) - sizeof(uint16_t));
+    if (incoming.crc16 != expectedCrc) {
+        Serial.printf("[RX CRC REJECT] Data Payload CRC mismatch: received 0x%04X, expected 0x%04X\n",
+                      incoming.crc16, expectedCrc);
+        return;
     }
 
     if (incoming.magic != MSG_TYPE_DATA) {
         return;
     }
 
-    // HARDENED FILTERING RULE 3: Explicit Sender & Target Validation
     if (incoming.sender_id != TARGET_NODE_ID || incoming.target_id != MY_NODE_ID) {
         return;
     }
 
-    // HARDENED FILTERING RULE 4: Strict Active Session ID Matching
-    // DATA payloads CANNOT establish or reset sessions. Stale or unauthenticated session IDs are DROPPED.
     if (incoming.session_id != targetSessionId) {
         Serial.printf("[RX SESSION REJECT] Dropped DATA with stale/unmatched Session ID %u (Active Session: %u)\n",
                       incoming.session_id, targetSessionId);
         return;
     }
 
-    // HARDENED FILTERING RULE 5: Single-Source Sequence Check for active session
     if (!isNewerSequence(incoming.seq, lastReceivedSeq)) {
         Serial.printf("[RX DROP #%u] Out-of-order or duplicate packet dropped (Last Seq: %u, Sender Session: %u)\n",
                       incoming.seq, lastReceivedSeq, incoming.session_id);
@@ -389,7 +435,6 @@ void receivedCallback(uint32_t from, String &msg) {
     lastReceivedSeq = incoming.seq;
     hasReceivedFirstPacket = true;
 
-    // Map sensor value (0-1023) to PWM range
     uint16_t pwmValue = incoming.sensor_value;
     if (pwmValue > PWM_RANGE) {
         pwmValue = PWM_RANGE;
@@ -408,10 +453,6 @@ void newConnectionCallback(uint32_t nodeId) {
     Serial.printf("[MESH] New Connection, nodeId = %u (Local Mesh Node ID = %u)\n", nodeId, mesh.getNodeId());
 }
 
-/**
- * Handles topology changes: verifies if targetMeshNodeId is still present in current node list.
- * If disconnected, resets targetMeshNodeId and transitions peerState to DISCOVERING.
- */
 void changedConnectionCallback() {
     Serial.printf("[MESH] Topology changed (Local Mesh Node ID = %u)\n", mesh.getNodeId());
 

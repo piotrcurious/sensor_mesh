@@ -63,10 +63,10 @@
 #define KALMAN_MEASUREMENT_NOISE_R 4.0f
 
 // ============================================================================
-// Compact Binary Struct Definitions (Includes Session Incarnation ID)
+// Compact Binary Struct Definitions (Includes Session ID & CRC16)
 // ============================================================================
 
-// Data Payload Struct (16 bytes: 1+2+2+4+2+1+4 = 16 bytes packed)
+// Data Payload Struct (18 bytes: 1+2+2+4+2+1+4+2 = 18 bytes packed)
 struct __attribute__((__packed__)) SensorMessage {
     uint8_t  magic;          // 1 byte  (MSG_TYPE_DATA = 0xA7)
     uint16_t sender_id;      // 2 bytes
@@ -75,23 +75,25 @@ struct __attribute__((__packed__)) SensorMessage {
     uint16_t sensor_value;   // 2 bytes
     uint8_t  digital_value;  // 1 byte
     uint32_t seq;            // 4 bytes
+    uint16_t crc16;          // 2 bytes CRC16 checksum
 };
 
-// Handshake Discovery Struct (13 bytes: 1+2+2+4+4 = 13 bytes packed)
+// Handshake Discovery Struct (15 bytes: 1+2+2+4+4+2 = 15 bytes packed)
 struct __attribute__((__packed__)) HandshakeMessage {
     uint8_t  magic;          // 1 byte  (MSG_TYPE_HELLO / MSG_TYPE_HELLO_ACK)
     uint16_t sender_id;      // 2 bytes
     uint16_t target_id;      // 2 bytes
     uint32_t session_id;     // 4 bytes
     uint32_t seq;            // 4 bytes
+    uint16_t crc16;          // 2 bytes CRC16 checksum
 };
 
 // Static assertions to ensure struct packing without undefined padding
-static_assert(sizeof(SensorMessage) == 16, "SensorMessage struct size must be exactly 16 bytes");
-static_assert(sizeof(HandshakeMessage) == 13, "HandshakeMessage struct size must be exactly 13 bytes");
+static_assert(sizeof(SensorMessage) == 18, "SensorMessage struct size must be exactly 18 bytes");
+static_assert(sizeof(HandshakeMessage) == 15, "HandshakeMessage struct size must be exactly 15 bytes");
 
-#define PAIR_WIRE_HEX_LEN      (sizeof(SensorMessage) * 2)     // 32 hex chars
-#define HANDSHAKE_WIRE_HEX_LEN (sizeof(HandshakeMessage) * 2)  // 26 hex chars
+#define PAIR_WIRE_HEX_LEN      (sizeof(SensorMessage) * 2)     // 36 hex chars
+#define HANDSHAKE_WIRE_HEX_LEN (sizeof(HandshakeMessage) * 2)  // 30 hex chars
 
 // Peer Discovery State Machine
 enum class PeerState : uint8_t {
