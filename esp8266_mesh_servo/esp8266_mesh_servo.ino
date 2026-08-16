@@ -1,17 +1,16 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Sender-Validated Unicast & Sequence Tracking)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Discovery State Machine & Direct Unicast)
   Uses painlessMesh to create an auto-organizing mesh network.
 
-  Fixes & Enhancements:
-  - Explicit Paired Sender Validation & Single-Source Sequence Verification:
-    * Rejects packets unless incoming.sender_id == TARGET_NODE_ID AND incoming.target_id == MY_NODE_ID.
-    * Ensures the single sequence tracking state (isNewerSequence) is logically isolated to the paired sender.
-    * Prevents sequence corruption or packet rejection from un-paired mesh nodes.
-  - Unicast Mesh Transport & Dynamic Target Discovery:
-    * Dynamically maps logical TARGET_NODE_ID to painlessMesh uint32_t transport node ID.
-    * Uses targeted mesh.sendSingle(targetMeshNodeId, payload) for direct unicast transport when connected.
+  Peer Discovery & Handshake Features:
+  - PeerState Enum: UNKNOWN, DISCOVERING, CONNECTED.
+  - Active Handshake Discovery: sends HELLO broadcast packets independently of sensor motion
+    until target node is discovered via HELLO / HELLO_ACK exchange.
+  - Unicast Mesh Transport (sendSingle) once CONNECTED.
+  - Dynamic Topology Invalidation: on changedConnectionCallback(), checks if targetMeshNodeId
+    remains connected in mesh.getNodeList(). If lost, state resets to DISCOVERING.
+  - Paired Sender Validation & Sequence Verification.
   - Sub-microsecond Fixed-Point Precision (FP4 = 1/16th us resolution).
-  - Wi-Fi PHY & Mesh connection stability (yield-friendly ADC oversampling).
   - Directional limit switch safety clamping.
 */
 
@@ -26,6 +25,7 @@ Servo myServo;
 
 // Function declarations
 void checkAndTransmitInputs();
+void sendHelloDiscovery();
 void receivedCallback(uint32_t from, String &msg);
 void newConnectionCallback(uint32_t nodeId);
 void changedConnectionCallback();
@@ -37,29 +37,36 @@ bool isNewerSequence(uint32_t incoming, uint32_t last);
 // Input polling task (50 ms)
 Task taskPollInputs(POLL_INTERVAL_MS, TASK_FOREVER, &checkAndTransmitInputs);
 
-// Kalman Filter State
-static float kalman_x = 512.0f; // Estimated value
-static float kalman_p = 1.0f;    // Estimation error covariance
+// Discovery task (1000 ms retry while DISCOVERING)
+Task taskDiscovery(DISCOVERY_INTERVAL_MS, TASK_FOREVER, &sendHelloDiscovery);
 
-// State tracking for change detection & network rate limiting (1/16th us units)
+// Peer Discovery State Machine
+static PeerState peerState = PeerState::UNKNOWN;
+static uint32_t targetMeshNodeId = 0; // Discovered painlessMesh uint32_t node ID for TARGET_NODE_ID
+
+// Kalman Filter State
+static float kalman_x = 512.0f;
+static float kalman_p = 1.0f;
+
+// State tracking for change detection & network rate limiting
 static uint16_t lastTransmittedUsFp4 = 0xFFFF;
 static uint8_t  lastDigitalVal = 0xFF;
 static uint8_t  lastMinLimit = 0xFF;
 static uint8_t  lastMaxLimit = 0xFF;
 static uint32_t lastTxTime = 0;
 static uint32_t messageSequence = 0;
+static uint32_t discoverySequence = 0;
 
-// Sequence verification and dynamic target painlessMesh Node ID mapping (Isolated to TARGET_NODE_ID)
+// Sequence verification (Isolated to TARGET_NODE_ID)
 static uint32_t lastReceivedSeq = 0;
 static bool     hasReceivedFirstPacket = false;
-static uint32_t targetMeshNodeId = 0; // Discovered painlessMesh uint32_t node ID for TARGET_NODE_ID
 
 // Motion control state separation in fixed-point 1/16th microseconds (FP4)
 static uint16_t requestedServoUsFp4 = 23552; // 1472 us * 16
 static uint16_t appliedServoUsFp4   = 23552;
 static uint16_t lastSafeUsFp4       = 23552;
 
-// Helper: Convert uint8_t hex character ('0'-'9', 'A'-'F', 'a'-'f') to byte value
+// Helper: Convert uint8_t hex character to byte
 static uint8_t hexCharToNibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -69,13 +76,11 @@ static uint8_t hexCharToNibble(char c) {
 
 /**
  * Wraparound-safe 32-bit sequence comparison.
- * Returns true if 'incoming' is strictly newer than 'last'.
  */
 bool isNewerSequence(uint32_t incoming, uint32_t last) {
     if (!hasReceivedFirstPacket) {
         return true;
     }
-    // Signed difference handles 32-bit integer overflow/wraparound correctly
     return ((int32_t)(incoming - last)) > 0;
 }
 
@@ -154,9 +159,15 @@ void setup() {
     mesh.onChangedConnections(&changedConnectionCallback);
     mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback);
 
-    // Add and enable polling task
+    // Start in DISCOVERING state
+    peerState = PeerState::DISCOVERING;
+
+    // Enable Tasks
     userScheduler.addTask(taskPollInputs);
     taskPollInputs.enable();
+
+    userScheduler.addTask(taskDiscovery);
+    taskDiscovery.enable();
 }
 
 void loop() {
@@ -164,8 +175,67 @@ void loop() {
 }
 
 /**
- * Polls inputs and transmits packet.
- * Uses mesh.sendSingle() when targetMeshNodeId is discovered, falling back to broadcast during discovery.
+ * Periodically broadcasts HELLO handshake packets when state is DISCOVERING / UNKNOWN.
+ */
+void sendHelloDiscovery() {
+    if (peerState == PeerState::CONNECTED) {
+        return; // Handshake complete, discovery task idle
+    }
+
+    HandshakeMessage helloMsg;
+    helloMsg.magic = MSG_TYPE_HELLO;
+    helloMsg.sender_id = MY_NODE_ID;
+    helloMsg.target_id = TARGET_NODE_ID;
+    helloMsg.seq = ++discoverySequence;
+
+    const size_t structSize = sizeof(HandshakeMessage);
+    const size_t hexLen = structSize * 2;
+    char hexBuffer[hexLen + 1];
+    const uint8_t* rawBytes = (const uint8_t*)&helloMsg;
+
+    for (size_t i = 0; i < structSize; i++) {
+        sprintf(&hexBuffer[i * 2], "%02X", rawBytes[i]);
+    }
+    hexBuffer[hexLen] = '\0';
+
+    mesh.sendBroadcast(String(hexBuffer));
+
+    Serial.printf("[DISCOVERY #%u] Sent HELLO broadcast for Target Node %u (State: DISCOVERING)\n",
+                  helloMsg.seq, TARGET_NODE_ID);
+}
+
+/**
+ * Sends a targeted HELLO_ACK response in reply to a received HELLO.
+ */
+void sendHelloAck(uint32_t destMeshId) {
+    HandshakeMessage ackMsg;
+    ackMsg.magic = MSG_TYPE_HELLO_ACK;
+    ackMsg.sender_id = MY_NODE_ID;
+    ackMsg.target_id = TARGET_NODE_ID;
+    ackMsg.seq = ++discoverySequence;
+
+    const size_t structSize = sizeof(HandshakeMessage);
+    const size_t hexLen = structSize * 2;
+    char hexBuffer[hexLen + 1];
+    const uint8_t* rawBytes = (const uint8_t*)&ackMsg;
+
+    for (size_t i = 0; i < structSize; i++) {
+        sprintf(&hexBuffer[i * 2], "%02X", rawBytes[i]);
+    }
+    hexBuffer[hexLen] = '\0';
+
+    String payload(hexBuffer);
+    if (!mesh.sendSingle(destMeshId, payload)) {
+        mesh.sendBroadcast(payload);
+    }
+
+    Serial.printf("[DISCOVERY #%u] Sent HELLO_ACK to Target Node %u (MeshID: %u)\n",
+                  ackMsg.seq, TARGET_NODE_ID, destMeshId);
+}
+
+/**
+ * Polls inputs and transmits data packet.
+ * Uses unicast sendSingle() if CONNECTED, falling back to broadcast during discovery.
  */
 void checkAndTransmitInputs() {
     float filteredAdc = readAnalogFiltered();
@@ -198,7 +268,7 @@ void checkAndTransmitInputs() {
 
     if ((stateChanged && rateLimitElapsed) || heartbeatElapsed) {
         ServoMeshMessage msg;
-        msg.magic = MESSAGE_MAGIC;
+        msg.magic = MSG_TYPE_DATA;
         msg.sender_id = MY_NODE_ID;
         msg.target_id = TARGET_NODE_ID;
         msg.target_us_fp4 = currentUsFp4;
@@ -219,9 +289,8 @@ void checkAndTransmitInputs() {
 
         String payload(hexBuffer);
 
-        // Targeted Unicast vs Discovery Broadcast
         bool sentDirect = false;
-        if (targetMeshNodeId != 0 && mesh.isConnected(targetMeshNodeId)) {
+        if (peerState == PeerState::CONNECTED && targetMeshNodeId != 0 && mesh.isConnected(targetMeshNodeId)) {
             sentDirect = mesh.sendSingle(targetMeshNodeId, payload);
         }
 
@@ -235,9 +304,10 @@ void checkAndTransmitInputs() {
         lastMaxLimit = currentMaxLimit;
         lastTxTime = now;
 
-        Serial.printf("[TX #%u] Filtered ADC: %.2f | Target Pulse: %.2f us (FP4: %u) | Transport: %s (Dest MeshID: %u)\n",
+        Serial.printf("[TX #%u] Filtered ADC: %.2f | Target Pulse: %.2f us (FP4: %u) | Transport: %s (Dest MeshID: %u, State: %s)\n",
                       msg.seq, filteredAdc, (float)currentUsFp4 / 16.0f, currentUsFp4,
-                      sentDirect ? "UNICAST (sendSingle)" : "BROADCAST", targetMeshNodeId);
+                      sentDirect ? "UNICAST (sendSingle)" : "BROADCAST", targetMeshNodeId,
+                      peerState == PeerState::CONNECTED ? "CONNECTED" : "DISCOVERING");
     }
 }
 
@@ -276,39 +346,67 @@ void updateLocalServoFp4(uint16_t newRequestedUsFp4) {
 
 /**
  * Callback when a mesh message is received.
- * Explicitly validates both sender_id and target_id before sequence checking.
+ * Handles HELLO / HELLO_ACK discovery and DATA messages.
  */
 void receivedCallback(uint32_t from, String &msg) {
-    const size_t expectedStructSize = sizeof(ServoMeshMessage);
-    const size_t expectedHexLen = expectedStructSize * 2;
+    // 1. Check for Handshake Messages (HELLO / HELLO_ACK)
+    if (msg.length() == sizeof(HandshakeMessage) * 2) {
+        HandshakeMessage handshake;
+        uint8_t* rawBytes = (uint8_t*)&handshake;
+        for (size_t i = 0; i < sizeof(HandshakeMessage); i++) {
+            char highNibble = msg.charAt(i * 2);
+            char lowNibble = msg.charAt(i * 2 + 1);
+            rawBytes[i] = (hexCharToNibble(highNibble) << 4) | hexCharToNibble(lowNibble);
+        }
 
-    if (msg.length() != expectedHexLen) {
+        if (handshake.sender_id == TARGET_NODE_ID && handshake.target_id == MY_NODE_ID) {
+            if (handshake.magic == MSG_TYPE_HELLO) {
+                targetMeshNodeId = from;
+                peerState = PeerState::CONNECTED;
+                Serial.printf("[HANDSHAKE] Received HELLO from Target Node %u (MeshID: %u). Transitioned to CONNECTED.\n",
+                              TARGET_NODE_ID, from);
+                sendHelloAck(from);
+            } else if (handshake.magic == MSG_TYPE_HELLO_ACK) {
+                targetMeshNodeId = from;
+                peerState = PeerState::CONNECTED;
+                Serial.printf("[HANDSHAKE] Received HELLO_ACK from Target Node %u (MeshID: %u). Transitioned to CONNECTED.\n",
+                              TARGET_NODE_ID, from);
+            }
+        }
+        return;
+    }
+
+    // 2. Check for Data Payload Messages
+    if (msg.length() != sizeof(ServoMeshMessage) * 2) {
         return;
     }
 
     ServoMeshMessage incoming;
     uint8_t* rawBytes = (uint8_t*)&incoming;
 
-    for (size_t i = 0; i < expectedStructSize; i++) {
+    for (size_t i = 0; i < sizeof(ServoMeshMessage); i++) {
         char highNibble = msg.charAt(i * 2);
         char lowNibble = msg.charAt(i * 2 + 1);
         rawBytes[i] = (hexCharToNibble(highNibble) << 4) | hexCharToNibble(lowNibble);
     }
 
-    if (incoming.magic != MESSAGE_MAGIC) {
+    if (incoming.magic != MSG_TYPE_DATA) {
         return;
     }
 
-    // Explicit Sender & Target Validation:
-    // Only accept messages originating from compile-time TARGET_NODE_ID addressed to MY_NODE_ID
+    // Explicit Sender & Target Validation
     if (incoming.sender_id != TARGET_NODE_ID || incoming.target_id != MY_NODE_ID) {
         return;
     }
 
-    // Automatically learn/update target's transport painlessMesh Node ID
+    // Auto-discover / verify target mesh ID
     targetMeshNodeId = from;
+    if (peerState != PeerState::CONNECTED) {
+        peerState = PeerState::CONNECTED;
+        Serial.printf("[STATE] Learned Target MeshID %u from DATA payload. Transitioned to CONNECTED.\n", from);
+    }
 
-    // Single-source sequence check: reject stale, duplicate, or reordered packets from paired sender
+    // Single-source sequence check
     if (!isNewerSequence(incoming.seq, lastReceivedSeq)) {
         Serial.printf("[RX DROP #%u] Out-of-order or duplicate packet dropped (Last Seq: %u, From Sender: %u, MeshID: %u)\n",
                       incoming.seq, lastReceivedSeq, incoming.sender_id, from);
@@ -333,8 +431,32 @@ void newConnectionCallback(uint32_t nodeId) {
     Serial.printf("[MESH] New Connection, nodeId = %u (Local Mesh Node ID = %u)\n", nodeId, mesh.getNodeId());
 }
 
+/**
+ * Handles topology changes: verifies if targetMeshNodeId is still present in current node list.
+ * If disconnected, resets targetMeshNodeId and transitions peerState to DISCOVERING.
+ */
 void changedConnectionCallback() {
     Serial.printf("[MESH] Topology changed (Local Mesh Node ID = %u)\n", mesh.getNodeId());
+
+    if (targetMeshNodeId != 0) {
+        SimpleList<uint32_t> nodes = mesh.getNodeList();
+        bool stillConnected = false;
+        SimpleList<uint32_t>::iterator node = nodes.begin();
+        while (node != nodes.end()) {
+            if (*node == targetMeshNodeId) {
+                stillConnected = true;
+                break;
+            }
+            node++;
+        }
+
+        if (!stillConnected) {
+            Serial.printf("[MESH] Target MeshID %u disconnected. Clearing peer state to DISCOVERING.\n", targetMeshNodeId);
+            targetMeshNodeId = 0;
+            peerState = PeerState::DISCOVERING;
+            hasReceivedFirstPacket = false;
+        }
+    }
 }
 
 void nodeTimeAdjustedCallback(int32_t offset) {

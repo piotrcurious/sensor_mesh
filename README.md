@@ -1,6 +1,6 @@
 # ESP8266 Bi-Directional Sensor & Servo Mesh (DSP Enhanced)
 
-An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring paired-sender packet filtering, sequence verification, unicast transport optimization, high-precision Digital Signal Processing (DSP) for analog inputs, sub-microsecond fixed-point resolution, directional limit switch protection, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
+An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, unicast transport optimization, high-precision Digital Signal Processing (DSP) for analog inputs, sub-microsecond fixed-point resolution, directional limit switch protection, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
 
 1. **`esp8266_mesh_pair`**: PWM & Digital IO version (transmits 1/sec periodic updates).
 2. **`esp8266_mesh_servo`**: Servo version (50ms input polling, 200ms network rate limiting, sub-microsecond FP4 fixed-point pulse transmission, directional limit switch safety clamping).
@@ -15,6 +15,8 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 |---|---|---|
 | **Input Polling Rate** | 1000 ms (1 Hz) | 50 ms (20 Hz local sampling, Wi-Fi PHY safe) |
 | **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Rate-limited (max 1 packet per 200 ms / 5 Hz) |
+| **Peer Discovery Protocol** | Active `HELLO` / `HELLO_ACK` handshake | Active `HELLO` / `HELLO_ACK` handshake |
+| **Peer State Machine** | `UNKNOWN`, `DISCOVERING`, `CONNECTED` | `UNKNOWN`, `DISCOVERING`, `CONNECTED` |
 | **Mesh Transport Mode** | Unicast `sendSingle()` (with broadcast discovery fallback) | Unicast `sendSingle()` (with broadcast discovery fallback) |
 | **Sender Filtering & Sequence** | Paired sender validation (`sender_id == TARGET_NODE_ID`) & wraparound sequence tracking | Paired sender validation (`sender_id == TARGET_NODE_ID`) & wraparound sequence tracking |
 | **Analog Input Processing** | Kahan Oversampling + Single Min/Max Outlier Rejection + 1D Kalman Filter | Kahan Oversampling + Single Min/Max Outlier Rejection + 1D Kalman Filter |
@@ -26,17 +28,43 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ---
 
-## 2. Unicast Routing, Sequence Control & Directional Safety
+## 2. Peer Discovery State Machine, Handshakes & Topology Invalidation
+
+### Active Handshake Discovery Protocol (`HELLO` / `HELLO_ACK`)
+- Rather than relying solely on change-driven sensor transmissions for discovery, each node runs an active discovery task during startup / reconnects (`DISCOVERING` state).
+- Periodically broadcasts a lightweight `HandshakeMessage` (`MSG_TYPE_HELLO`).
+- When the target node receives a `HELLO` addressed to it, it transitions to `CONNECTED`, records `targetMeshNodeId`, and replies with a targeted `MSG_TYPE_HELLO_ACK`.
+- This ensures target discovery succeeds instantly upon boot regardless of whether sensor inputs are actively changing.
+
+### Peer State Machine
+```
+   [ UNKNOWN / DISCOVERING ]
+             │
+             │  Receives HELLO / HELLO_ACK / DATA
+             ▼
+       [ CONNECTED ]
+             │
+             │  Topology change: targetMeshNodeId missing from mesh.getNodeList()
+             ▼
+   [ UNKNOWN / DISCOVERING ]
+```
+
+### Dynamic Topology Invalidation
+- On mesh connection changes (`changedConnectionCallback()`), the node inspects `mesh.getNodeList()`.
+- If the paired `targetMeshNodeId` is no longer connected in the mesh topology, `targetMeshNodeId` is cleared and `peerState` reverts to `DISCOVERING`.
+
+---
+
+## 3. Unicast Routing, Sequence Control & Directional Safety
 
 ### Paired Sender Filtering & Sequence Tracking
 - Filters incoming packets to explicitly enforce `incoming.sender_id == TARGET_NODE_ID` and `incoming.target_id == MY_NODE_ID`.
-- Isolates single-source sequence tracking (`isNewerSequence`) exclusively to the paired node, preventing sequence state corruption or false drops if un-paired nodes exist on the same mesh.
+- Isolates single-source sequence tracking (`isNewerSequence`) exclusively to the paired node.
 - Evaluates incoming sequence counters using signed 32-bit arithmetic to safely handle integer wraparound and reject stale, duplicate, or reordered packets.
 
 ### Unicast `sendSingle()` Routing Optimization
 - Maps logical application IDs (`MY_NODE_ID`, `TARGET_NODE_ID`) to transport-level painlessMesh 32-bit node IDs (`mesh.getNodeId()`).
-- Automatically learns the paired node's transport ID upon receiving incoming packets.
-- Transmits using targeted unicast `mesh.sendSingle(targetMeshNodeId, payload)` once connected, drastically reducing mesh channel saturation compared to broadcast flooding.
+- Transmits using targeted unicast `mesh.sendSingle(targetMeshNodeId, payload)` once `CONNECTED`, drastically reducing mesh channel saturation compared to broadcast flooding.
 
 ### Sub-Microsecond FP4 Fixed-Point Resolution
 - Target pulse durations are represented in fixed-point **FP4 units** ($1\text{ unit} = 1/16\text{th }\mu s$).
@@ -49,7 +77,7 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ---
 
-## 3. Hardware Requirements & Wiring
+## 4. Hardware Requirements & Wiring
 
 ### Hardware
 - **2 or more ESP8266 boards** (NodeMCU V2, Wemos D1 Mini, ESP-12E, etc.)
@@ -72,7 +100,7 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ---
 
-## 4. Firmware Setup & Compilation
+## 5. Firmware Setup & Compilation
 
 ### Required Arduino Libraries
 - **Painless Mesh** (`painlessMesh` v1.5.7)
@@ -111,9 +139,9 @@ arduino-cli upload -p /dev/ttyUSB1 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
 
 ---
 
-## 5. Operation & Diagnostics
+## 6. Operation & Diagnostics
 
-1. **Unicast & Sequence Verification Logs**:
+1. **Discovery & Unicast Logs**:
    ```text
    ==================================================
    ESP8266 Bi-directional Servo Mesh Node
@@ -122,8 +150,9 @@ arduino-cli upload -p /dev/ttyUSB1 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
    Digital In: GPIO 4 (D2) | Digital Out: GPIO 0 (D3)
    Min Limit Pin: GPIO 12 (D6) | Max Limit Pin: GPIO 13 (D7)
    ==================================================
-   [MESH] New Connection, nodeId = 312847102 (Local Mesh Node ID = 312847101)
-   [TX #1] Filtered ADC: 512.35 | Target Pulse: 1472.25 us (FP4: 23556) | Transport: UNICAST (sendSingle) (Dest MeshID: 312847102)
+   [DISCOVERY #1] Sent HELLO broadcast for Target Node 2 (State: DISCOVERING)
+   [HANDSHAKE] Received HELLO_ACK from Target Node 2 (MeshID: 312847102). Transitioned to CONNECTED.
+   [TX #1] Filtered ADC: 512.35 | Target Pulse: 1472.25 us (FP4: 23556) | Transport: UNICAST (sendSingle) (Dest MeshID: 312847102, State: CONNECTED)
    [RX #1] From Node: 2 | Target Pulse: 1950.12 us (FP4: 31202) | Digital: 1 | Remote MinLim: 0 | Remote MaxLim: 0
    [SERVO FP4] Requested: 1950.12 us (31202) -> Applied: 1950 us (31202 FP4) | LastSafe: 31202 FP4 (MinLim: 0, MaxLim: 0)
    ```

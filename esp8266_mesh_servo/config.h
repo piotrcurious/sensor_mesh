@@ -51,7 +51,6 @@
 #define SERVO_MAX_PULSE_WIDTH 2400
 
 // Change detection threshold in 1/16th microseconds (FP4)
-// 16 units = 1.0 us; 8 units = 0.5 us delta to trigger event-driven transmission
 #define PULSE_FP4_CHANGE_THRESHOLD 8
 
 // Maximum interval between transmissions even if no state changes (heartbeat ms)
@@ -63,11 +62,14 @@
 // Network rate limit: minimum time between mesh packet broadcasts (200 ms = 5 Hz max packet rate)
 #define MIN_TX_INTERVAL_MS 200
 
+// Peer Discovery Retry Interval (ms) during DISCOVERING state
+#define DISCOVERY_INTERVAL_MS 1000
+
 // ============================================================================
 // DSP & Precision Parameters (Oversampling, Kahan, Outlier, Kalman)
 // ============================================================================
 
-// Oversampling count per sample cycle (4 samples to protect ESP8266 Wi-Fi PHY time-slicing)
+// Oversampling count per sample cycle
 #define ADC_OVERSAMPLE_COUNT 4
 
 // Kalman Filter Tuning Parameters
@@ -82,15 +84,18 @@
 #define MESH_PASSWORD   "MeshServoPassword123"
 #define MESH_PORT       5555
 
-// Message Magic Byte for verifying packed struct binary integrity
-#define MESSAGE_MAGIC   0xB9
+// Message Type Magic Bytes for Protocol
+#define MSG_TYPE_DATA       0xB9
+#define MSG_TYPE_HELLO      0xE1
+#define MSG_TYPE_HELLO_ACK  0xE2
 
 // ============================================================================
-// Compact Binary Struct Definition (Fixed-Point Sub-Microsecond Precision)
+// Compact Binary Struct Definitions
 // ============================================================================
 
+// Data Payload Struct
 struct __attribute__((__packed__)) ServoMeshMessage {
-    uint8_t  magic;            // Magic header byte (0xB9)
+    uint8_t  magic;            // Magic header byte (MSG_TYPE_DATA = 0xB9)
     uint16_t sender_id;        // Custom compile-time sender node ID
     uint16_t target_id;        // Custom compile-time target node ID
     uint16_t target_us_fp4;    // Target pulse width in fixed-point 1/16th microseconds (us * 16)
@@ -98,6 +103,21 @@ struct __attribute__((__packed__)) ServoMeshMessage {
     uint8_t  min_limit_active; // Min limit switch state (1 = triggered/active, 0 = open)
     uint8_t  max_limit_active; // Max limit switch state (1 = triggered/active, 0 = open)
     uint32_t seq;              // Message sequence counter
+};
+
+// Handshake Discovery Struct (HELLO / HELLO_ACK)
+struct __attribute__((__packed__)) HandshakeMessage {
+    uint8_t  magic;            // Magic header byte (MSG_TYPE_HELLO / MSG_TYPE_HELLO_ACK)
+    uint16_t sender_id;        // Custom compile-time sender node ID
+    uint16_t target_id;        // Custom compile-time target node ID
+    uint32_t seq;              // Sequence counter / timestamp
+};
+
+// Peer Discovery State Machine
+enum class PeerState : uint8_t {
+    UNKNOWN,
+    DISCOVERING,
+    CONNECTED
 };
 
 #endif // SERVO_CONFIG_H
