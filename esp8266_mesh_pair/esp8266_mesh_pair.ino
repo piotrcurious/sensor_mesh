@@ -1,7 +1,7 @@
 /*
   ESP8266 Bi-directional Sensor Mesh Node Firmware (High-Precision DSP)
   Uses painlessMesh to create an auto-organizing mesh network.
-  Reads analog input pin (A0) with Kahan summation oversampling, outlier rejection,
+  Reads analog input pin (A0) with Kahan summation oversampling, single min/max outlier rejection,
   and 1D Kalman filtering every 1 second and transmits compact binary packed struct data
   to a paired node (configured via MY_NODE_ID and TARGET_NODE_ID).
   When receiving messages addressed to MY_NODE_ID, sets PWM output pin (D1) and
@@ -45,40 +45,35 @@ static uint8_t hexCharToNibble(char c) {
  * High-Precision Analog Read:
  * 1. Takes ADC_OVERSAMPLE_COUNT samples.
  * 2. Uses Kahan Summation algorithm to accumulate total without precision loss.
- * 3. Applies Outlier Rejection (discards min and max values).
+ * 3. Applies Outlier Rejection: subtracts exactly ONE minVal and ONE maxVal.
  * 4. Filters result through 1D Kalman Filter.
  */
 float readAnalogFiltered() {
-    uint16_t samples[ADC_OVERSAMPLE_COUNT];
-    uint16_t minVal = 1024;
+    uint16_t minVal = 1023;
     uint16_t maxVal = 0;
-
-    // 1. Oversample ADC
-    for (size_t i = 0; i < ADC_OVERSAMPLE_COUNT; i++) {
-        uint16_t val = analogRead(SENSOR_PIN);
-        samples[i] = val;
-        if (val < minVal) minVal = val;
-        if (val > maxVal) maxVal = val;
-    }
-
-    // 2. Kahan Summation with Outlier Rejection
     float sum = 0.0f;
     float c = 0.0f; // Compensation variable for lost low-order bits
-    size_t validSamplesCount = 0;
 
+    // 1. Oversample ADC & accumulate with Kahan summation
     for (size_t i = 0; i < ADC_OVERSAMPLE_COUNT; i++) {
-        // Outlier rejection: discard min and max if oversampling count >= 4
-        if (ADC_OVERSAMPLE_COUNT >= 4 && (samples[i] == minVal || samples[i] == maxVal)) {
-            continue;
-        }
-        float y = (float)samples[i] - c;
+        uint16_t val = analogRead(SENSOR_PIN);
+        if (val < minVal) minVal = val;
+        if (val > maxVal) maxVal = val;
+
+        float y = (float)val - c;
         float t = sum + y;
         c = (t - sum) - y;
         sum = t;
-        validSamplesCount++;
     }
 
-    float averageAdc = (validSamplesCount > 0) ? (sum / (float)validSamplesCount) : (float)minVal;
+    // 2. Outlier Rejection: Subtract exactly ONE minVal and ONE maxVal
+    float averageAdc;
+    if (ADC_OVERSAMPLE_COUNT >= 4) {
+        float trimmedSum = sum - (float)minVal - (float)maxVal;
+        averageAdc = trimmedSum / (float)(ADC_OVERSAMPLE_COUNT - 2);
+    } else {
+        averageAdc = sum / (float)ADC_OVERSAMPLE_COUNT;
+    }
 
     // 3. 1D Kalman Filter Update
     kalman_p = kalman_p + KALMAN_PROCESS_NOISE_Q;

@@ -1,13 +1,16 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (High-Precision DSP & Rate Limited)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (High-Precision DSP & Directional Limit Safety)
   Uses painlessMesh to create an auto-organizing mesh network.
 
-  DSP & Rate Limiting Features:
-  - High-frequency input polling (every 5 ms / 200 Hz) for immediate local motion update and limit switch clamping.
+  Fixes & Enhancements:
+  - Directional limit switch safety clamping:
+    * MIN active: forbids further movement toward MIN (targetUs < lastSafeUs), allows movement toward MAX.
+    * MAX active: forbids further movement toward MAX (targetUs > lastSafeUs), allows movement toward MIN.
+    * Separates requestedServoUs from appliedServoUs / lastSafeUs.
+  - Correct single min/max trimmed-mean outlier rejection with Kahan summation.
+  - High-frequency input polling (every 5 ms / 200 Hz) for immediate local motion update.
   - Rate-limited network transmissions (minimum 200 ms between mesh packet broadcasts).
-  - Analog oversampling with Kahan Summation to eliminate floating point accumulation error.
-  - Outlier rejection (trimmed mean discarding highest and lowest ADC samples).
-  - 1D Kalman Filter to produce ultra-smooth analog readings.
+  - 1D Kalman Filter for ultra-smooth analog readings.
   - High-precision Servo driving using myServo.writeMicroseconds().
 */
 
@@ -44,8 +47,10 @@ static uint8_t  lastMaxLimit = 0xFF;
 static uint32_t lastTxTime = 0;
 static uint32_t messageSequence = 0;
 
-// Current target microsecond pulse width for local servo
-static uint16_t currentTargetUs = 1472; // Default midpoint (~90 deg)
+// Motion control state separation
+static uint16_t requestedServoUs = 1472; // Desired target pulse from local input or remote node
+static uint16_t appliedServoUs   = 1472; // Actually applied pulse width driven to servo
+static uint16_t lastSafeUs       = 1472; // Last safe position accepted before limit restriction
 
 // Helper: Convert uint8_t hex character ('0'-'9', 'A'-'F', 'a'-'f') to byte value
 static uint8_t hexCharToNibble(char c) {
@@ -59,40 +64,35 @@ static uint8_t hexCharToNibble(char c) {
  * High-Precision Analog Read:
  * 1. Takes ADC_OVERSAMPLE_COUNT samples.
  * 2. Uses Kahan Summation algorithm to accumulate total without precision loss.
- * 3. Applies Outlier Rejection (discards min and max values).
+ * 3. Applies Outlier Rejection: subtracts exactly ONE minVal and ONE maxVal.
  * 4. Filters result through 1D Kalman Filter.
  */
 float readAnalogFiltered() {
-    uint16_t samples[ADC_OVERSAMPLE_COUNT];
-    uint16_t minVal = 1024;
+    uint16_t minVal = 1023;
     uint16_t maxVal = 0;
-
-    // 1. Oversample ADC
-    for (size_t i = 0; i < ADC_OVERSAMPLE_COUNT; i++) {
-        uint16_t val = analogRead(SENSOR_PIN);
-        samples[i] = val;
-        if (val < minVal) minVal = val;
-        if (val > maxVal) maxVal = val;
-    }
-
-    // 2. Kahan Summation with Outlier Rejection
     float sum = 0.0f;
     float c = 0.0f; // Compensation variable for lost low-order bits
-    size_t validSamplesCount = 0;
 
+    // 1. Oversample ADC & accumulate with Kahan summation
     for (size_t i = 0; i < ADC_OVERSAMPLE_COUNT; i++) {
-        // Outlier rejection: discard min and max if oversampling count >= 4
-        if (ADC_OVERSAMPLE_COUNT >= 4 && (samples[i] == minVal || samples[i] == maxVal)) {
-            continue;
-        }
-        float y = (float)samples[i] - c;
+        uint16_t val = analogRead(SENSOR_PIN);
+        if (val < minVal) minVal = val;
+        if (val > maxVal) maxVal = val;
+
+        float y = (float)val - c;
         float t = sum + y;
         c = (t - sum) - y;
         sum = t;
-        validSamplesCount++;
     }
 
-    float averageAdc = (validSamplesCount > 0) ? (sum / (float)validSamplesCount) : (float)minVal;
+    // 2. Outlier Rejection: Subtract exactly ONE minVal and ONE maxVal
+    float averageAdc;
+    if (ADC_OVERSAMPLE_COUNT >= 4) {
+        float trimmedSum = sum - (float)minVal - (float)maxVal;
+        averageAdc = trimmedSum / (float)(ADC_OVERSAMPLE_COUNT - 2);
+    } else {
+        averageAdc = sum / (float)ADC_OVERSAMPLE_COUNT;
+    }
 
     // 3. 1D Kalman Filter Update
     kalman_p = kalman_p + KALMAN_PROCESS_NOISE_Q;
@@ -109,7 +109,7 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (5ms Poll / 200ms Rate Limit)\n");
+    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Directional Safety & Fixed Trimmed Mean)\n");
     Serial.printf("My Node ID: %u -> Target Node ID: %u\n", MY_NODE_ID, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
                   SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
@@ -132,7 +132,7 @@ void setup() {
 
     // Attach Servo with calibrated pulse width range (544 to 2400 us)
     myServo.attach(SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
-    updateLocalServoMicroseconds(currentTargetUs);
+    updateLocalServoMicroseconds(requestedServoUs);
 
     // Initialize painlessMesh network
     mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
@@ -170,9 +170,9 @@ void checkAndTransmitInputs() {
     uint8_t currentMinLimit = (digitalRead(MIN_LIMIT_PIN) == LOW) ? 1 : 0;
     uint8_t currentMaxLimit = (digitalRead(MAX_LIMIT_PIN) == LOW) ? 1 : 0;
 
-    // Local limit switch reaction (updates local servo immediately every 5ms)
+    // Local limit switch reaction (updates local servo safety clamping immediately every 5ms)
     if (currentMinLimit != lastMinLimit || currentMaxLimit != lastMaxLimit) {
-        updateLocalServoMicroseconds(currentTargetUs);
+        updateLocalServoMicroseconds(requestedServoUs);
     }
 
     // Determine if state changed significantly
@@ -225,33 +225,41 @@ void checkAndTransmitInputs() {
 }
 
 /**
- * Calculates and updates local servo pulse width in microseconds while respecting local limit switch clamping.
+ * Calculates and updates local servo pulse width in microseconds with directional limit clamping.
+ *
+ * Safety Model:
+ * - MIN active: forbids movement toward MIN (targetUs < lastSafeUs), allows movement toward MAX.
+ * - MAX active: forbids movement toward MAX (targetUs > lastSafeUs), allows movement toward MIN.
+ * - Keeps separate tracking for requestedServoUs, appliedServoUs, and lastSafeUs.
  */
-void updateLocalServoMicroseconds(uint16_t requestedUs) {
-    currentTargetUs = requestedUs;
+void updateLocalServoMicroseconds(uint16_t newRequestedUs) {
+    requestedServoUs = newRequestedUs;
 
-    uint16_t targetUs = constrain(requestedUs, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
+    uint16_t targetUs = constrain(requestedServoUs, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
 
-    // Read current local limit switches
-    bool minLimitActive = (digitalRead(MIN_LIMIT_PIN) == LOW);
-    bool maxLimitActive = (digitalRead(MAX_LIMIT_PIN) == LOW);
+    // Read current local limit switches (Active LOW)
+    bool minActive = (digitalRead(MIN_LIMIT_PIN) == LOW);
+    bool maxActive = (digitalRead(MAX_LIMIT_PIN) == LOW);
 
-    uint16_t finalUs = targetUs;
-    uint16_t midPulse = (SERVO_MIN_PULSE_WIDTH + SERVO_MAX_PULSE_WIDTH) / 2;
-
-    // Clamp servo movement if limit switches are triggered
-    if (minLimitActive && finalUs < midPulse) {
-        finalUs = SERVO_MIN_PULSE_WIDTH;
-    }
-    if (maxLimitActive && finalUs > midPulse) {
-        finalUs = SERVO_MAX_PULSE_WIDTH;
+    // Apply directional limit switch protection
+    if (minActive && targetUs < lastSafeUs) {
+        // Block further movement toward MIN, hold last safe position
+        targetUs = lastSafeUs;
     }
 
-    // Drive servo with microsecond resolution
-    myServo.writeMicroseconds(finalUs);
+    if (maxActive && targetUs > lastSafeUs) {
+        // Block further movement toward MAX, hold last safe position
+        targetUs = lastSafeUs;
+    }
 
-    Serial.printf("[SERVO us] Requested Pulse: %u us -> Final Pulse: %u us (MinLim: %d, MaxLim: %d)\n",
-                  requestedUs, finalUs, minLimitActive, maxLimitActive);
+    // Drive servo with safe target pulse width
+    myServo.writeMicroseconds(targetUs);
+
+    appliedServoUs = targetUs;
+    lastSafeUs = targetUs;
+
+    Serial.printf("[SERVO us] Requested: %u us -> Applied: %u us | LastSafe: %u us (MinLim: %d, MaxLim: %d)\n",
+                  requestedServoUs, appliedServoUs, lastSafeUs, minActive, maxActive);
 }
 
 /**
