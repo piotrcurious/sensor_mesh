@@ -50,8 +50,9 @@
 #define SERVO_MIN_PULSE_WIDTH 544
 #define SERVO_MAX_PULSE_WIDTH 2400
 
-// Change detection thresholds (in microseconds)
-#define PULSE_CHANGE_THRESHOLD 3 // Minimum 3us delta to trigger event-driven transmission
+// Change detection threshold in 1/16th microseconds (FP4)
+// 16 units = 1.0 us; 8 units = 0.5 us delta to trigger event-driven transmission
+#define PULSE_FP4_CHANGE_THRESHOLD 8
 
 // Maximum interval between transmissions even if no state changes (heartbeat ms)
 #define HEARTBEAT_INTERVAL_MS 5000
@@ -82,17 +83,17 @@
 #define MESH_PORT       5555
 
 // Message Magic Byte for verifying packed struct binary integrity
-#define MESSAGE_MAGIC   0xB8
+#define MESSAGE_MAGIC   0xB9
 
 // ============================================================================
-// Compact Binary Struct Definition
+// Compact Binary Struct Definition (Fixed-Point Sub-Microsecond Precision)
 // ============================================================================
 
 struct __attribute__((__packed__)) ServoMeshMessage {
-    uint8_t  magic;            // Magic header byte (0xB8)
+    uint8_t  magic;            // Magic header byte (0xB9)
     uint16_t sender_id;        // Custom compile-time sender node ID
     uint16_t target_id;        // Custom compile-time target node ID
-    uint16_t target_us;        // Target servo pulse width in microseconds (544 - 2400 us)
+    uint16_t target_us_fp4;    // Target pulse width in fixed-point 1/16th microseconds (us * 16)
     uint8_t  digital_value;    // Digital input state (0 or 1)
     uint8_t  min_limit_active; // Min limit switch state (1 = triggered/active, 0 = open)
     uint8_t  max_limit_active; // Max limit switch state (1 = triggered/active, 0 = open)
