@@ -1,16 +1,14 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (High-Precision DSP)
   Uses painlessMesh to create an auto-organizing mesh network.
 
-  Features:
-  - Event-driven transmission: sends updates immediately when input states change
-    (analog input A0, digital input D2, min limit switch D6, max limit switch D7),
-    plus periodic heartbeat transmissions.
-  - Controls local Servo motor (D1) based on target node analog position.
-  - Servo pulse-width range calibrated (544 us to 2400 us) for standard micro-servos (e.g. SG90/MG996R).
-  - Local limit switch clamping: limit switches (D6, D7) clamp local servo movement
-    to protect physical hardware.
-  - Transmits local limit switch states to corresponding paired node.
+  DSP & Precision Features:
+  - Analog oversampling with Kahan Summation to eliminate floating point accumulation error.
+  - Outlier rejection (trimmed mean discarding highest and lowest ADC samples).
+  - 1D Kalman Filter to produce ultra-smooth analog readings.
+  - High-precision Servo driving using myServo.writeMicroseconds().
+  - Event-driven transmission when input changes exceed pulse width threshold.
+  - Local limit switch clamping on microsecond servo movement.
 */
 
 #include <painlessMesh.h>
@@ -28,21 +26,26 @@ void receivedCallback(uint32_t from, String &msg);
 void newConnectionCallback(uint32_t nodeId);
 void changedConnectionCallback();
 void nodeTimeAdjustedCallback(int32_t offset);
-void updateLocalServoAngle(uint16_t requestedAnalogVal);
+void updateLocalServoMicroseconds(uint16_t requestedUs);
+float readAnalogFiltered();
 
 // Polling task (checks for state changes every POLL_INTERVAL_MS)
 Task taskPollInputs(POLL_INTERVAL_MS, TASK_FOREVER, &checkAndTransmitInputs);
 
+// Kalman Filter State
+static float kalman_x = 512.0f; // Estimated value
+static float kalman_p = 1.0f;    // Estimation error covariance
+
 // State tracking for change detection
-static uint16_t lastAnalogVal = 0xFFFF;
+static uint16_t lastTransmittedUs = 0xFFFF;
 static uint8_t  lastDigitalVal = 0xFF;
 static uint8_t  lastMinLimit = 0xFF;
 static uint8_t  lastMaxLimit = 0xFF;
 static uint32_t lastTxTime = 0;
 static uint32_t messageSequence = 0;
 
-// Current requested analog position for local servo
-static uint16_t currentTargetAnalogVal = 512;
+// Current target microsecond pulse width for local servo
+static uint16_t currentTargetUs = 1472; // Default midpoint (~90 deg)
 
 // Helper: Convert uint8_t hex character ('0'-'9', 'A'-'F', 'a'-'f') to byte value
 static uint8_t hexCharToNibble(char c) {
@@ -52,15 +55,66 @@ static uint8_t hexCharToNibble(char c) {
     return 0;
 }
 
+/**
+ * High-Precision Analog Read:
+ * 1. Takes ADC_OVERSAMPLE_COUNT samples.
+ * 2. Uses Kahan Summation algorithm to accumulate total without precision loss.
+ * 3. Applies Outlier Rejection (discards min and max values).
+ * 4. Filters result through 1D Kalman Filter.
+ */
+float readAnalogFiltered() {
+    uint16_t samples[ADC_OVERSAMPLE_COUNT];
+    uint16_t minVal = 1024;
+    uint16_t maxVal = 0;
+
+    // 1. Oversample ADC
+    for (size_t i = 0; i < ADC_OVERSAMPLE_COUNT; i++) {
+        uint16_t val = analogRead(SENSOR_PIN);
+        samples[i] = val;
+        if (val < minVal) minVal = val;
+        if (val > maxVal) maxVal = val;
+    }
+
+    // 2. Kahan Summation with Outlier Rejection
+    float sum = 0.0f;
+    float c = 0.0f; // Compensation variable for lost low-order bits
+    size_t validSamplesCount = 0;
+
+    for (size_t i = 0; i < ADC_OVERSAMPLE_COUNT; i++) {
+        // Outlier rejection: discard min and max if oversampling count >= 4
+        if (ADC_OVERSAMPLE_COUNT >= 4 && (samples[i] == minVal || samples[i] == maxVal)) {
+            continue;
+        }
+        float y = (float)samples[i] - c;
+        float t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+        validSamplesCount++;
+    }
+
+    float averageAdc = (validSamplesCount > 0) ? (sum / (float)validSamplesCount) : (float)minVal;
+
+    // 3. 1D Kalman Filter Update
+    // Prediction step
+    kalman_p = kalman_p + KALMAN_PROCESS_NOISE_Q;
+
+    // Measurement update step
+    float k_gain = kalman_p / (kalman_p + KALMAN_MEASUREMENT_NOISE_R);
+    kalman_x = kalman_x + k_gain * (averageAdc - kalman_x);
+    kalman_p = (1.0f - k_gain) * kalman_p;
+
+    return kalman_x;
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Servo & Sensor Mesh Node\n");
+    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (DSP Enhanced)\n");
     Serial.printf("My Node ID: %u -> Target Node ID: %u\n", MY_NODE_ID, TARGET_NODE_ID);
-    Serial.printf("Analog In: A0 | Servo Pin: GPIO %d (D1) [Pulse: %d - %d us]\n",
+    Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
                   SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
     Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
     Serial.printf("Min Limit Pin: GPIO %d (D6) | Max Limit Pin: GPIO %d (D7)\n", MIN_LIMIT_PIN, MAX_LIMIT_PIN);
@@ -76,9 +130,12 @@ void setup() {
     pinMode(MIN_LIMIT_PIN, INPUT_PULLUP);
     pinMode(MAX_LIMIT_PIN, INPUT_PULLUP);
 
+    // Initialize Kalman state with initial reading
+    kalman_x = (float)analogRead(SENSOR_PIN);
+
     // Attach Servo with calibrated pulse width range (544 to 2400 us)
     myServo.attach(SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
-    updateLocalServoAngle(currentTargetAnalogVal);
+    updateLocalServoMicroseconds(currentTargetUs);
 
     // Initialize painlessMesh network
     mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
@@ -101,7 +158,13 @@ void loop() {
  * Checks all inputs for state changes and transmits if changed or if heartbeat interval elapsed.
  */
 void checkAndTransmitInputs() {
-    uint16_t currentAnalog = analogRead(SENSOR_PIN);
+    // Read high-precision filtered analog value (0.0f - 1023.0f)
+    float filteredAdc = readAnalogFiltered();
+
+    // Map high-precision ADC reading directly to servo microseconds (544 - 2400 us)
+    float targetPulseUs = SERVO_MIN_PULSE_WIDTH + (filteredAdc / 1023.0f) * (SERVO_MAX_PULSE_WIDTH - SERVO_MIN_PULSE_WIDTH);
+    uint16_t currentUs = (uint16_t)constrain((int)roundf(targetPulseUs), SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
+
     uint8_t currentDigital = digitalRead(DIGITAL_INPUT_PIN);
 
     // Limit switches are active LOW (0 when pressed/active, 1 when open)
@@ -110,11 +173,11 @@ void checkAndTransmitInputs() {
 
     // Check if limit switch state changed locally -> update local servo clamping immediately
     if (currentMinLimit != lastMinLimit || currentMaxLimit != lastMaxLimit) {
-        updateLocalServoAngle(currentTargetAnalogVal);
+        updateLocalServoMicroseconds(currentTargetUs);
     }
 
     // Determine if state changed significantly
-    bool analogChanged = (abs((int)currentAnalog - (int)lastAnalogVal) >= ANALOG_CHANGE_THRESHOLD);
+    bool pulseChanged = (abs((int)currentUs - (int)lastTransmittedUs) >= PULSE_CHANGE_THRESHOLD);
     bool digitalChanged = (currentDigital != lastDigitalVal);
     bool minLimitChanged = (currentMinLimit != lastMinLimit);
     bool maxLimitChanged = (currentMaxLimit != lastMaxLimit);
@@ -122,13 +185,13 @@ void checkAndTransmitInputs() {
     uint32_t now = millis();
     bool heartbeat = (now - lastTxTime >= HEARTBEAT_INTERVAL_MS);
 
-    if (analogChanged || digitalChanged || minLimitChanged || maxLimitChanged || heartbeat) {
+    if (pulseChanged || digitalChanged || minLimitChanged || maxLimitChanged || heartbeat) {
         // Construct binary payload
         ServoMeshMessage msg;
         msg.magic = MESSAGE_MAGIC;
         msg.sender_id = MY_NODE_ID;
         msg.target_id = TARGET_NODE_ID;
-        msg.sensor_value = currentAnalog;
+        msg.target_us = currentUs;
         msg.digital_value = currentDigital;
         msg.min_limit_active = currentMinLimit;
         msg.max_limit_active = currentMaxLimit;
@@ -148,45 +211,45 @@ void checkAndTransmitInputs() {
         mesh.sendBroadcast(String(hexBuffer));
 
         // Update last state tracking
-        lastAnalogVal = currentAnalog;
+        lastTransmittedUs = currentUs;
         lastDigitalVal = currentDigital;
         lastMinLimit = currentMinLimit;
         lastMaxLimit = currentMaxLimit;
         lastTxTime = now;
 
-        Serial.printf("[TX #%u] Analog: %u | Digital: %u | MinLim: %u | MaxLim: %u -> Target Node: %u (Hex: %s)\n",
-                      msg.seq, currentAnalog, currentDigital, currentMinLimit, currentMaxLimit, TARGET_NODE_ID, hexBuffer);
+        Serial.printf("[TX #%u] Filtered ADC: %.2f | Target Pulse: %u us | Digital: %u | MinLim: %u | MaxLim: %u (Hex: %s)\n",
+                      msg.seq, filteredAdc, currentUs, currentDigital, currentMinLimit, currentMaxLimit, hexBuffer);
     }
 }
 
 /**
- * Calculates and updates local servo angle while respecting local limit switch clamping.
+ * Calculates and updates local servo pulse width in microseconds while respecting local limit switch clamping.
  */
-void updateLocalServoAngle(uint16_t requestedAnalogVal) {
-    currentTargetAnalogVal = requestedAnalogVal;
+void updateLocalServoMicroseconds(uint16_t requestedUs) {
+    currentTargetUs = requestedUs;
 
-    // Map analog sensor range (0-1023) to servo angle (SERVO_MIN_ANGLE - SERVO_MAX_ANGLE)
-    int targetAngle = map((int)requestedAnalogVal, 0, 1023, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
-    targetAngle = constrain(targetAngle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+    uint16_t targetUs = constrain(requestedUs, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
 
     // Read current local limit switches
     bool minLimitActive = (digitalRead(MIN_LIMIT_PIN) == LOW);
     bool maxLimitActive = (digitalRead(MAX_LIMIT_PIN) == LOW);
 
-    int finalAngle = targetAngle;
+    uint16_t finalUs = targetUs;
+    uint16_t midPulse = (SERVO_MIN_PULSE_WIDTH + SERVO_MAX_PULSE_WIDTH) / 2;
 
     // Clamp servo movement if limit switches are triggered
-    if (minLimitActive && finalAngle < (SERVO_MIN_ANGLE + SERVO_MAX_ANGLE) / 2) {
-        finalAngle = SERVO_MIN_ANGLE;
+    if (minLimitActive && finalUs < midPulse) {
+        finalUs = SERVO_MIN_PULSE_WIDTH;
     }
-    if (maxLimitActive && finalAngle > (SERVO_MIN_ANGLE + SERVO_MAX_ANGLE) / 2) {
-        finalAngle = SERVO_MAX_ANGLE;
+    if (maxLimitActive && finalUs > midPulse) {
+        finalUs = SERVO_MAX_PULSE_WIDTH;
     }
 
-    myServo.write(finalAngle);
+    // Drive servo with microsecond resolution
+    myServo.writeMicroseconds(finalUs);
 
-    Serial.printf("[SERVO] Requested Analog: %u -> Target Angle: %d deg | Clamped Angle: %d deg (MinLim: %d, MaxLim: %d)\n",
-                  requestedAnalogVal, targetAngle, finalAngle, minLimitActive, maxLimitActive);
+    Serial.printf("[SERVO us] Requested Pulse: %u us -> Final Pulse: %u us (MinLim: %d, MaxLim: %d)\n",
+                  requestedUs, finalUs, minLimitActive, maxLimitActive);
 }
 
 /**
@@ -218,11 +281,11 @@ void receivedCallback(uint32_t from, String &msg) {
         // Update local digital output (D3)
         digitalWrite(DIGITAL_OUTPUT_PIN, incoming.digital_value ? HIGH : LOW);
 
-        // Update local servo angle with received analog position (respecting local limit clamping)
-        updateLocalServoAngle(incoming.sensor_value);
+        // Update local servo with received high-precision microsecond target
+        updateLocalServoMicroseconds(incoming.target_us);
 
-        Serial.printf("[RX #%u] From Node: %u | Sensor: %u | Digital: %u | Remote MinLim: %u | Remote MaxLim: %u\n",
-                      incoming.seq, incoming.sender_id, incoming.sensor_value, incoming.digital_value,
+        Serial.printf("[RX #%u] From Node: %u | Target Pulse: %u us | Digital: %u | Remote MinLim: %u | Remote MaxLim: %u\n",
+                      incoming.seq, incoming.sender_id, incoming.target_us, incoming.digital_value,
                       incoming.min_limit_active, incoming.max_limit_active);
     } else {
         Serial.printf("[RELAY] From Node: %u to Target Node: %u (relayed via %u)\n",

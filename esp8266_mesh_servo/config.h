@@ -40,7 +40,7 @@
 #define MAX_LIMIT_PIN D7
 
 // ============================================================================
-// Servo Parameters & Pulse Calibration
+// Servo Parameters & Microsecond Pulse Calibration
 // ============================================================================
 
 #define SERVO_MIN_ANGLE 0
@@ -50,14 +50,25 @@
 #define SERVO_MIN_PULSE_WIDTH 544
 #define SERVO_MAX_PULSE_WIDTH 2400
 
-// Change detection thresholds
-#define ANALOG_CHANGE_THRESHOLD 8 // Minimum ADC delta (~0.8% change) to trigger transmission
+// Change detection thresholds (in microseconds)
+#define PULSE_CHANGE_THRESHOLD 3 // Minimum 3us delta to trigger event-driven transmission
 
 // Maximum interval between transmissions even if no state changes (heartbeat ms)
 #define HEARTBEAT_INTERVAL_MS 5000
 
-// Poll interval for input change detection (ms)
-#define POLL_INTERVAL_MS 50
+// Poll interval for input change detection and DSP sampling (ms)
+#define POLL_INTERVAL_MS 20
+
+// ============================================================================
+// DSP & Precision Parameters (Oversampling, Kahan, Outlier, Kalman)
+// ============================================================================
+
+// Oversampling count per sample cycle
+#define ADC_OVERSAMPLE_COUNT 16
+
+// Kalman Filter Tuning Parameters
+#define KALMAN_PROCESS_NOISE_Q 0.05f
+#define KALMAN_MEASUREMENT_NOISE_R 4.0f
 
 // ============================================================================
 // Mesh Network Configuration
@@ -68,17 +79,17 @@
 #define MESH_PORT       5555
 
 // Message Magic Byte for verifying packed struct binary integrity
-#define MESSAGE_MAGIC   0xB7
+#define MESSAGE_MAGIC   0xB8
 
 // ============================================================================
 // Compact Binary Struct Definition
 // ============================================================================
 
 struct __attribute__((__packed__)) ServoMeshMessage {
-    uint8_t  magic;            // Magic header byte (0xB7)
+    uint8_t  magic;            // Magic header byte (0xB8)
     uint16_t sender_id;        // Custom compile-time sender node ID
     uint16_t target_id;        // Custom compile-time target node ID
-    uint16_t sensor_value;     // Analog sensor value (0-1023)
+    uint16_t target_us;        // Target servo pulse width in microseconds (544 - 2400 us)
     uint8_t  digital_value;    // Digital input state (0 or 1)
     uint8_t  min_limit_active; // Min limit switch state (1 = triggered/active, 0 = open)
     uint8_t  max_limit_active; // Max limit switch state (1 = triggered/active, 0 = open)

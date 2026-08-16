@@ -48,17 +48,24 @@
 #define SEND_INTERVAL_MS 1000
 
 // Message Magic Byte for verifying packed struct binary integrity
-#define MESSAGE_MAGIC   0xA5
+#define MESSAGE_MAGIC   0xA6
+
+// Oversampling count per sample cycle
+#define ADC_OVERSAMPLE_COUNT 16
+
+// Kalman Filter Tuning Parameters
+#define KALMAN_PROCESS_NOISE_Q 0.05f
+#define KALMAN_MEASUREMENT_NOISE_R 4.0f
 
 // ============================================================================
 // Compact Binary Struct Definition
 // ============================================================================
 
 struct __attribute__((__packed__)) SensorMessage {
-    uint8_t  magic;          // Magic header byte (0xA5)
+    uint8_t  magic;          // Magic header byte (0xA6)
     uint16_t sender_id;      // Custom compile-time sender node ID
     uint16_t target_id;      // Custom compile-time target node ID
-    uint16_t sensor_value;   // Analog sensor value (0-1023)
+    uint16_t sensor_value;   // High-precision analog sensor value (0-1023)
     uint8_t  digital_value;  // Digital input state (0 or 1 from D2)
     uint32_t seq;            // Message sequence counter
 };
