@@ -1,11 +1,17 @@
 /*
-  ESP8266 Bi-directional Sensor Mesh Node Firmware (High-Precision DSP)
+  ESP8266 Bi-directional Sensor Mesh Node Firmware (Unicast & Sequence Checking)
   Uses painlessMesh to create an auto-organizing mesh network.
-  Reads analog input pin (A0) with Kahan summation oversampling, single min/max outlier rejection,
-  and 1D Kalman filtering every 1 second and transmits compact binary packed struct data
-  to a paired node (configured via MY_NODE_ID and TARGET_NODE_ID).
-  When receiving messages addressed to MY_NODE_ID, sets PWM output pin (D1) and
-  digital output pin (D3).
+
+  Fixes & Enhancements:
+  - Sequence Tracking & Out-of-Order Rejection:
+    * Implements wraparound-safe sequence comparison (isNewerSequence).
+    * Rejects stale, duplicate, or reordered packets.
+  - Unicast Mesh Transport & Dynamic Target Discovery:
+    * Dynamically maps logical TARGET_NODE_ID to painlessMesh uint32_t transport node ID.
+    * Uses targeted mesh.sendSingle(targetMeshNodeId, payload) for direct unicast transport when connected,
+      falling back to mesh.sendBroadcast(payload) during initial discovery.
+  - High-Precision DSP filtering (Kahan summation, outlier rejection, 1D Kalman filter).
+  - Drives PWM pin (D1) and digital output pin (D3).
 */
 
 #include <painlessMesh.h>
@@ -22,6 +28,7 @@ void newConnectionCallback(uint32_t nodeId);
 void changedConnectionCallback();
 void nodeTimeAdjustedCallback(int32_t offset);
 float readAnalogFiltered();
+bool isNewerSequence(uint32_t incoming, uint32_t last);
 
 // Task to read sensor and transmit data every 1 second (SEND_INTERVAL_MS)
 Task taskSendSensorData(SEND_INTERVAL_MS, TASK_FOREVER, &sendSensorData);
@@ -30,8 +37,11 @@ Task taskSendSensorData(SEND_INTERVAL_MS, TASK_FOREVER, &sendSensorData);
 static float kalman_x = 512.0f; // Estimated value
 static float kalman_p = 1.0f;    // Estimation error covariance
 
-// Sequence counter
+// Sequence tracking
 static uint32_t messageSequence = 0;
+static uint32_t lastReceivedSeq = 0;
+static bool     hasReceivedFirstPacket = false;
+static uint32_t targetMeshNodeId = 0; // Discovered painlessMesh uint32_t node ID for TARGET_NODE_ID
 
 // Helper: Convert uint8_t hex character ('0'-'9', 'A'-'F', 'a'-'f') to byte value
 static uint8_t hexCharToNibble(char c) {
@@ -42,19 +52,25 @@ static uint8_t hexCharToNibble(char c) {
 }
 
 /**
- * High-Precision Analog Read:
- * 1. Takes ADC_OVERSAMPLE_COUNT samples with yields to protect Wi-Fi PHY tasks.
- * 2. Uses Kahan Summation algorithm to accumulate total without precision loss.
- * 3. Applies Outlier Rejection: subtracts exactly ONE minVal and ONE maxVal.
- * 4. Filters result through 1D Kalman Filter.
+ * Wraparound-safe 32-bit sequence comparison.
+ * Returns true if 'incoming' is strictly newer than 'last'.
+ */
+bool isNewerSequence(uint32_t incoming, uint32_t last) {
+    if (!hasReceivedFirstPacket) {
+        return true;
+    }
+    return ((int32_t)(incoming - last)) > 0;
+}
+
+/**
+ * High-Precision Analog Read with Kahan Summation and Outlier Rejection.
  */
 float readAnalogFiltered() {
     uint16_t minVal = 1023;
     uint16_t maxVal = 0;
     float sum = 0.0f;
-    float c = 0.0f; // Compensation variable for lost low-order bits
+    float c = 0.0f;
 
-    // 1. Oversample ADC & accumulate with Kahan summation
     for (size_t i = 0; i < ADC_OVERSAMPLE_COUNT; i++) {
         uint16_t val = analogRead(SENSOR_PIN);
         if (val < minVal) minVal = val;
@@ -65,10 +81,9 @@ float readAnalogFiltered() {
         c = (t - sum) - y;
         sum = t;
 
-        optimistic_yield(1000); // Yield to Wi-Fi PHY layer
+        optimistic_yield(1000);
     }
 
-    // 2. Outlier Rejection: Subtract exactly ONE minVal and ONE maxVal
     float averageAdc;
     if (ADC_OVERSAMPLE_COUNT >= 4) {
         float trimmedSum = sum - (float)minVal - (float)maxVal;
@@ -77,7 +92,6 @@ float readAnalogFiltered() {
         averageAdc = sum / (float)ADC_OVERSAMPLE_COUNT;
     }
 
-    // 3. 1D Kalman Filter Update
     kalman_p = kalman_p + KALMAN_PROCESS_NOISE_Q;
     float k_gain = kalman_p / (kalman_p + KALMAN_MEASUREMENT_NOISE_R);
     kalman_x = kalman_x + k_gain * (averageAdc - kalman_x);
@@ -101,11 +115,11 @@ void setup() {
     // Initialize hardware pins
     pinMode(SENSOR_PIN, INPUT);
     pinMode(PWM_PIN, OUTPUT);
-    analogWrite(PWM_PIN, 0); // Start PWM at 0% duty cycle
+    analogWrite(PWM_PIN, 0);
 
     pinMode(DIGITAL_INPUT_PIN, INPUT_PULLUP);
     pinMode(DIGITAL_OUTPUT_PIN, OUTPUT);
-    digitalWrite(DIGITAL_OUTPUT_PIN, LOW); // Default digital output state
+    digitalWrite(DIGITAL_OUTPUT_PIN, LOW);
 
     // Initialize Kalman state
     kalman_x = (float)analogRead(SENSOR_PIN);
@@ -123,23 +137,19 @@ void setup() {
 }
 
 void loop() {
-    // Keep painlessMesh and TaskScheduler running
     mesh.update();
 }
 
 /**
  * Reads DSP-filtered analog input and digital input, packs into binary struct,
- * hex-encodes it, and broadcasts over mesh.
+ * hex-encodes it, and sends via targeted sendSingle or broadcast fallback.
  */
 void sendSensorData() {
-    // Read high-precision filtered analog value
     float filteredVal = readAnalogFiltered();
     uint16_t highResSensorVal = (uint16_t)constrain((int)roundf(filteredVal), 0, 1023);
 
-    // Read digital pin (D2)
     uint8_t digitalVal = digitalRead(DIGITAL_INPUT_PIN);
 
-    // Construct binary payload
     SensorMessage msg;
     msg.magic = MESSAGE_MAGIC;
     msg.sender_id = MY_NODE_ID;
@@ -148,7 +158,6 @@ void sendSensorData() {
     msg.digital_value = digitalVal;
     msg.seq = ++messageSequence;
 
-    // Hex-encode struct to avoid 0x00 null byte truncation in painlessMesh JSON serialization
     const size_t structSize = sizeof(SensorMessage);
     const size_t hexLen = structSize * 2;
     char hexBuffer[hexLen + 1];
@@ -159,10 +168,21 @@ void sendSensorData() {
     }
     hexBuffer[hexLen] = '\0';
 
-    mesh.sendBroadcast(String(hexBuffer));
+    String payload(hexBuffer);
 
-    Serial.printf("[TX #%u] Filtered ADC: %.2f (Val: %u) | Digital D2: %u -> Target Node: %u (Hex: %s)\n",
-                  msg.seq, filteredVal, highResSensorVal, digitalVal, TARGET_NODE_ID, hexBuffer);
+    // Targeted Unicast vs Discovery Broadcast
+    bool sentDirect = false;
+    if (targetMeshNodeId != 0 && mesh.isConnected(targetMeshNodeId)) {
+        sentDirect = mesh.sendSingle(targetMeshNodeId, payload);
+    }
+
+    if (!sentDirect) {
+        mesh.sendBroadcast(payload);
+    }
+
+    Serial.printf("[TX #%u] Filtered ADC: %.2f (Val: %u) | Digital D2: %u | Transport: %s (Dest MeshID: %u)\n",
+                  msg.seq, filteredVal, highResSensorVal, digitalVal,
+                  sentDirect ? "UNICAST (sendSingle)" : "BROADCAST", targetMeshNodeId);
 }
 
 /**
@@ -172,12 +192,10 @@ void receivedCallback(uint32_t from, String &msg) {
     const size_t expectedStructSize = sizeof(SensorMessage);
     const size_t expectedHexLen = expectedStructSize * 2;
 
-    // Validate string length matches expected HEX payload size
     if (msg.length() != expectedHexLen) {
         return;
     }
 
-    // Decode HEX string back into binary SensorMessage struct
     SensorMessage incoming;
     uint8_t* rawBytes = (uint8_t*)&incoming;
 
@@ -187,41 +205,51 @@ void receivedCallback(uint32_t from, String &msg) {
         rawBytes[i] = (hexCharToNibble(highNibble) << 4) | hexCharToNibble(lowNibble);
     }
 
-    // Verify magic byte
     if (incoming.magic != MESSAGE_MAGIC) {
         return;
     }
 
-    // Check if message is directed to this node
     if (incoming.target_id == MY_NODE_ID) {
-        // Map sensor value (0-1023) to PWM range (0-PWM_RANGE)
+        // Automatically learn target's transport painlessMesh Node ID
+        if (incoming.sender_id == TARGET_NODE_ID) {
+            targetMeshNodeId = from;
+        }
+
+        // Sequence check: reject stale, duplicate, or reordered packets
+        if (!isNewerSequence(incoming.seq, lastReceivedSeq)) {
+            Serial.printf("[RX DROP #%u] Out-of-order or duplicate packet dropped (Last Seq: %u, From MeshID: %u)\n",
+                          incoming.seq, lastReceivedSeq, from);
+            return;
+        }
+
+        lastReceivedSeq = incoming.seq;
+        hasReceivedFirstPacket = true;
+
+        // Map sensor value (0-1023) to PWM range
         uint16_t pwmValue = incoming.sensor_value;
         if (pwmValue > PWM_RANGE) {
             pwmValue = PWM_RANGE;
         }
 
-        // Drive the PWM pin (D1)
         analogWrite(PWM_PIN, pwmValue);
 
-        // Drive the digital output pin (D3)
         uint8_t digitalState = incoming.digital_value ? HIGH : LOW;
         digitalWrite(DIGITAL_OUTPUT_PIN, digitalState);
 
         Serial.printf("[RX #%u] From Node: %u | Analog: %u -> PWM Duty: %u/%d | Digital D2 -> D3: %u (Mesh NodeID: %u)\n",
                       incoming.seq, incoming.sender_id, incoming.sensor_value, pwmValue, PWM_RANGE, digitalState, from);
     } else {
-        // Message is relayed automatically by painlessMesh to other nodes
         Serial.printf("[RELAY] From Node: %u to Target Node: %u (relayed via mesh node %u)\n",
                       incoming.sender_id, incoming.target_id, from);
     }
 }
 
 void newConnectionCallback(uint32_t nodeId) {
-    Serial.printf("[MESH] New Connection, nodeId = %u\n", nodeId);
+    Serial.printf("[MESH] New Connection, nodeId = %u (Local Mesh Node ID = %u)\n", nodeId, mesh.getNodeId());
 }
 
 void changedConnectionCallback() {
-    Serial.printf("[MESH] Topology changed\n");
+    Serial.printf("[MESH] Topology changed (Local Mesh Node ID = %u)\n", mesh.getNodeId());
 }
 
 void nodeTimeAdjustedCallback(int32_t offset) {

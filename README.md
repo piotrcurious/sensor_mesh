@@ -1,6 +1,6 @@
 # ESP8266 Bi-Directional Sensor & Servo Mesh (DSP Enhanced)
 
-An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring high-precision Digital Signal Processing (DSP) for analog inputs, sub-microsecond fixed-point resolution, directional limit switch protection, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
+An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring sequence verification, unicast transport optimization, high-precision Digital Signal Processing (DSP) for analog inputs, sub-microsecond fixed-point resolution, directional limit switch protection, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
 
 1. **`esp8266_mesh_pair`**: PWM & Digital IO version (transmits 1/sec periodic updates).
 2. **`esp8266_mesh_servo`**: Servo version (50ms input polling, 200ms network rate limiting, sub-microsecond FP4 fixed-point pulse transmission, directional limit switch safety clamping).
@@ -15,6 +15,8 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 |---|---|---|
 | **Input Polling Rate** | 1000 ms (1 Hz) | 50 ms (20 Hz local sampling, Wi-Fi PHY safe) |
 | **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Rate-limited (max 1 packet per 200 ms / 5 Hz) |
+| **Mesh Transport Mode** | Unicast `sendSingle()` (with broadcast discovery fallback) | Unicast `sendSingle()` (with broadcast discovery fallback) |
+| **Packet Sequence Verification**| Wraparound-safe 32-bit sequence tracking & out-of-order rejection | Wraparound-safe 32-bit sequence tracking & out-of-order rejection |
 | **Analog Input Processing** | Kahan Oversampling + Single Min/Max Outlier Rejection + 1D Kalman Filter | Kahan Oversampling + Single Min/Max Outlier Rejection + 1D Kalman Filter |
 | **Actuator Drive Resolution**| PWM Output on `D1` (GPIO 5, 0-1023) | Sub-microsecond FP4 Fixed-Point (1/16th $\mu s$) via `writeMicroseconds()` |
 | **Digital IO Pin** | `D2` In $\rightarrow$ `D3` Out | `D2` In $\rightarrow$ `D3` Out |
@@ -24,44 +26,26 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ---
 
-## 2. Sub-Microsecond Precision & Directional Limit Safety
+## 2. Unicast Routing, Sequence Control & Directional Safety
+
+### Unicast `sendSingle()` Routing Optimization & Node ID Mapping
+- Maps logical application IDs (`MY_NODE_ID`, `TARGET_NODE_ID`) to transport-level painlessMesh 32-bit node IDs (`mesh.getNodeId()`).
+- Automatically learns the paired node's transport ID upon receiving incoming packets.
+- Transmits using targeted unicast `mesh.sendSingle(targetMeshNodeId, payload)` once connected, drastically reducing mesh channel saturation compared to broadcast flooding.
+
+### Wraparound-Safe Sequence Tracking
+- Transmits an incrementing 32-bit sequence counter (`seq`).
+- Evaluates incoming packets using signed 32-bit arithmetic (`isNewerSequence`).
+- Drops old, duplicate, or reordered packets to prevent backward jumping or actuator jitter.
 
 ### Sub-Microsecond FP4 Fixed-Point Resolution
-To prevent coarse integer truncation of fractional ADC estimates produced by Kahan oversampling and Kalman filtering:
 - Target pulse durations are represented in fixed-point **FP4 units** ($1\text{ unit} = 1/16\text{th }\mu s$).
-- For a pulse duration of $1472.25\ \mu s$, the transmitted FP4 payload value is $1472.25 \times 16 = 23556$.
-- This preserves sub-microsecond fractional precision across network mesh transmission.
-
-### Wi-Fi PHY & Mesh Stability
-ESP8266 uses a shared multiplexed SAR ADC (`system_adc_read()`) that briefly pauses Wi-Fi radio reception during conversion. To ensure painlessMesh auto-discovery, AP/STA topology changes, and packet receptions function without RF dropouts:
-- ADC oversampling uses 4 samples per read cycle interleaved with `optimistic_yield()` calls to give time back to the ESP8266 Wi-Fi stack.
-- Input polling is scheduled at 50 ms (20 Hz) to allow seamless mesh network topology updates.
+- Preserves fractional ADC precision gained through Kahan oversampling and Kalman filtering across network transmissions.
 
 ### Directional Limit Switch Safety Model (`esp8266_mesh_servo`)
-Rather than jumping to extreme pulse limits when a limit switch triggers (which can push the actuator into physical end-stops), the firmware enforces **directional motion protection**:
 - **MIN limit switch active (`D6`)**: Forbids further movement toward MIN (`targetUsFp4 < lastSafeUsFp4`), holding `lastSafeUsFp4`, while permitting movement toward MAX (`targetUsFp4 > lastSafeUsFp4`).
 - **MAX limit switch active (`D7`)**: Forbids further movement toward MAX (`targetUsFp4 > lastSafeUsFp4`), holding `lastSafeUsFp4`, while permitting movement toward MIN (`targetUsFp4 < lastSafeUsFp4`).
 - Explicitly separates `requestedServoUsFp4` (desired position) from `appliedServoUsFp4` / `lastSafeUsFp4` (actually commanded hardware position).
-
-### Advanced DSP Pipeline
-1. **Kahan Summation Oversampling**: Accumulates ADC samples using the Kahan Summation algorithm to eliminate floating-point precision loss.
-2. **Accurate Trimmed-Mean Outlier Rejection**: Subtracts exactly one minimum sample value and one maximum sample value before averaging.
-3. **1D Kalman Filtering**: Passes oversampled readings through a 1-dimensional Kalman Filter (`Q = 0.05`, `R = 4.0`).
-4. **Compact Packed Binary Structs (Hex Encoded)**: Hex-encodes packed structs to guarantee null bytes (`0x00`) do not truncate painlessMesh JSON payloads.
-
-   **Servo Mesh Struct (`ServoMeshMessage`):**
-   ```cpp
-   struct __attribute__((__packed__)) ServoMeshMessage {
-       uint8_t  magic;            // Magic byte (0xB9)
-       uint16_t sender_id;        // Sender node ID
-       uint16_t target_id;        // Target node ID
-       uint16_t target_us_fp4;    // Target pulse width in fixed-point 1/16th microseconds (us * 16)
-       uint8_t  digital_value;    // Digital input state (0 or 1 from D2)
-       uint8_t  min_limit_active; // Min limit switch state (1 = active/pressed from D6)
-       uint8_t  max_limit_active; // Max limit switch state (1 = active/pressed from D7)
-       uint32_t seq;              // Sequence counter
-   };
-   ```
 
 ---
 
@@ -129,17 +113,17 @@ arduino-cli upload -p /dev/ttyUSB1 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
 
 ## 5. Operation & Diagnostics
 
-1. **Sub-Microsecond Resolution Logs**:
+1. **Unicast & Sequence Verification Logs**:
    ```text
    ==================================================
-   ESP8266 Bi-directional Servo Mesh Node (Sub-Microsecond FP4 Precision)
+   ESP8266 Bi-directional Servo Mesh Node
    My Node ID: 1 -> Target Node ID: 2
    Analog In: A0 (DSP Kahan+Kalman) | Servo Pin: GPIO 5 (D1) [544 - 2400 us]
    Digital In: GPIO 4 (D2) | Digital Out: GPIO 0 (D3)
    Min Limit Pin: GPIO 12 (D6) | Max Limit Pin: GPIO 13 (D7)
    ==================================================
-   [MESH] New Connection, nodeId = 312847102
-   [TX #1] Filtered ADC: 512.35 | Target Pulse: 1472.25 us (FP4: 23556) | Digital: 1 | MinLim: 0 | MaxLim: 0 (Hex: B901000200145C01000001000000)
+   [MESH] New Connection, nodeId = 312847102 (Local Mesh Node ID = 312847101)
+   [TX #1] Filtered ADC: 512.35 | Target Pulse: 1472.25 us (FP4: 23556) | Transport: UNICAST (sendSingle) (Dest MeshID: 312847102)
    [RX #1] From Node: 2 | Target Pulse: 1950.12 us (FP4: 31202) | Digital: 1 | Remote MinLim: 0 | Remote MaxLim: 0
    [SERVO FP4] Requested: 1950.12 us (31202) -> Applied: 1950 us (31202 FP4) | LastSafe: 31202 FP4 (MinLim: 0, MaxLim: 0)
    ```
