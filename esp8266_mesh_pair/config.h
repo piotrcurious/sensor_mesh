@@ -51,9 +51,9 @@
 #define DISCOVERY_INTERVAL_MS 1000
 
 // Message Type Magic Bytes for Protocol
-#define MSG_TYPE_DATA       0xA6
-#define MSG_TYPE_HELLO      0xE1
-#define MSG_TYPE_HELLO_ACK  0xE2
+#define MSG_TYPE_DATA       0xA7
+#define MSG_TYPE_HELLO      0xE3
+#define MSG_TYPE_HELLO_ACK  0xE4
 
 // Oversampling count per sample cycle
 #define ADC_OVERSAMPLE_COUNT 4
@@ -63,14 +63,15 @@
 #define KALMAN_MEASUREMENT_NOISE_R 4.0f
 
 // ============================================================================
-// Compact Binary Struct Definitions
+// Compact Binary Struct Definitions (Includes Session Incarnation ID)
 // ============================================================================
 
 // Data Payload Struct
 struct __attribute__((__packed__)) SensorMessage {
-    uint8_t  magic;          // Magic header byte (MSG_TYPE_DATA = 0xA6)
+    uint8_t  magic;          // Magic header byte (MSG_TYPE_DATA = 0xA7)
     uint16_t sender_id;      // Custom compile-time sender node ID
     uint16_t target_id;      // Custom compile-time target node ID
+    uint32_t session_id;     // Sender reboot/boot session incarnation token
     uint16_t sensor_value;   // High-precision analog sensor value (0-1023)
     uint8_t  digital_value;  // Digital input state (0 or 1 from D2)
     uint32_t seq;            // Message sequence counter
@@ -81,6 +82,7 @@ struct __attribute__((__packed__)) HandshakeMessage {
     uint8_t  magic;          // Magic header byte (MSG_TYPE_HELLO / MSG_TYPE_HELLO_ACK)
     uint16_t sender_id;      // Custom compile-time sender node ID
     uint16_t target_id;      // Custom compile-time target node ID
+    uint32_t session_id;     // Sender reboot/boot session incarnation token
     uint32_t seq;            // Sequence counter / timestamp
 };
 

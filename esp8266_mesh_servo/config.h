@@ -85,19 +85,20 @@
 #define MESH_PORT       5555
 
 // Message Type Magic Bytes for Protocol
-#define MSG_TYPE_DATA       0xB9
-#define MSG_TYPE_HELLO      0xE1
-#define MSG_TYPE_HELLO_ACK  0xE2
+#define MSG_TYPE_DATA       0xBA
+#define MSG_TYPE_HELLO      0xE3
+#define MSG_TYPE_HELLO_ACK  0xE4
 
 // ============================================================================
-// Compact Binary Struct Definitions
+// Compact Binary Struct Definitions (Includes Session Incarnation ID)
 // ============================================================================
 
 // Data Payload Struct
 struct __attribute__((__packed__)) ServoMeshMessage {
-    uint8_t  magic;            // Magic header byte (MSG_TYPE_DATA = 0xB9)
+    uint8_t  magic;            // Magic header byte (MSG_TYPE_DATA = 0xBA)
     uint16_t sender_id;        // Custom compile-time sender node ID
     uint16_t target_id;        // Custom compile-time target node ID
+    uint32_t session_id;       // Sender reboot/boot session incarnation token
     uint16_t target_us_fp4;    // Target pulse width in fixed-point 1/16th microseconds (us * 16)
     uint8_t  digital_value;    // Digital input state (0 or 1)
     uint8_t  min_limit_active; // Min limit switch state (1 = triggered/active, 0 = open)
@@ -110,6 +111,7 @@ struct __attribute__((__packed__)) HandshakeMessage {
     uint8_t  magic;            // Magic header byte (MSG_TYPE_HELLO / MSG_TYPE_HELLO_ACK)
     uint16_t sender_id;        // Custom compile-time sender node ID
     uint16_t target_id;        // Custom compile-time target node ID
+    uint32_t session_id;       // Sender reboot/boot session incarnation token
     uint32_t seq;              // Sequence counter / timestamp
 };
 

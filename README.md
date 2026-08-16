@@ -1,6 +1,6 @@
 # ESP8266 Bi-Directional Sensor & Servo Mesh (DSP Enhanced)
 
-An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring traffic separation (unicast control vs. discovery broadcasts), active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, high-precision Digital Signal Processing (DSP) for analog inputs, sub-microsecond fixed-point resolution, directional limit switch protection, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
+An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring boot session incarnation tracking (`session_id`), traffic separation (unicast control vs. discovery broadcasts), active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, high-precision Digital Signal Processing (DSP) for analog inputs, sub-microsecond fixed-point resolution, directional limit switch protection, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
 
 1. **`esp8266_mesh_pair`**: PWM & Digital IO version (transmits 1/sec periodic updates).
 2. **`esp8266_mesh_servo`**: Servo version (50ms input polling, 200ms network rate limiting, sub-microsecond FP4 fixed-point pulse transmission, directional limit switch safety clamping).
@@ -15,6 +15,7 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 |---|---|---|
 | **Input Polling Rate** | 1000 ms (1 Hz) | 50 ms (20 Hz local sampling, Wi-Fi PHY safe) |
 | **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Rate-limited (max 1 packet per 200 ms / 5 Hz) |
+| **Session Incarnation Tracking**| Boot session token `session_id` (auto-resets sequence on node reboot) | Boot session token `session_id` (auto-resets sequence on node reboot) |
 | **Control Traffic Transport** | Strict Targeted Unicast `mesh.sendSingle()` | Strict Targeted Unicast `mesh.sendSingle()` |
 | **Discovery Traffic Transport**| Infrequent Broadcast `MSG_TYPE_HELLO` | Infrequent Broadcast `MSG_TYPE_HELLO` |
 | **Peer State Machine** | `UNKNOWN`, `DISCOVERING`, `CONNECTED` | `UNKNOWN`, `DISCOVERING`, `CONNECTED` |
@@ -24,14 +25,19 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 | **Digital IO Pin** | `D2` In $\rightarrow$ `D3` Out | `D2` In $\rightarrow$ `D3` Out |
 | **Limit Switch Support** | N/A | `D6` (Min Limit) & `D7` (Max Limit) |
 | **Limit Switch Safety**| N/A | Directional motion blocking (forbids movement toward triggered limit, allows reverse) |
-| **Struct Size** | 12 bytes (24 hex characters) | 14 bytes (28 hex characters) |
+| **Struct Size** | 16 bytes (32 hex characters) | 18 bytes (36 hex characters) |
 
 ---
 
-## 2. Traffic Separation, Discovery State Machine & Safety
+## 2. Boot Session Incarnation Tracking & Traffic Separation
+
+### Boot Session Incarnation ID (`session_id`)
+To ensure node reboots do not cause packet rejection loops when the sequence counter resets to 0:
+- Each node generates a unique 32-bit `mySessionId` token upon boot (`ESP.getChipId() ^ micros() ^ random()`).
+- The `session_id` is transmitted in both Handshake (`HandshakeMessage`) and Data (`ServoMeshMessage` / `SensorMessage`) frames.
+- When a new `session_id` is received from `TARGET_NODE_ID`, the receiver automatically re-synchronizes and resets its sequence counter (`lastReceivedSeq = 0`), eliminating stale sequence lockout across reboots.
 
 ### Traffic Separation (Control vs. Discovery)
-To prevent network channel saturation and broadcast storm degradation on growing painlessMesh networks:
 - **CONTROL Traffic**: Sensor and servo motion payload frames are transmitted **EXCLUSIVELY via targeted unicast** (`mesh.sendSingle`). If disconnected, control payloads are suppressed.
 - **DISCOVERY Traffic**: Broadcasts are strictly isolated to infrequent `HandshakeMessage` (`MSG_TYPE_HELLO`) frames sent only while in the `DISCOVERING` state.
 
@@ -42,14 +48,6 @@ To prevent network channel saturation and broadcast storm degradation on growing
 ### Dynamic Topology Invalidation
 - On mesh connection changes (`changedConnectionCallback()`), the node inspects `mesh.getNodeList()`.
 - If the paired `targetMeshNodeId` is no longer connected in the mesh topology, `targetMeshNodeId` is cleared and `peerState` reverts to `DISCOVERING`.
-
-### Paired Sender Filtering & Sequence Tracking
-- Filters incoming packets to explicitly enforce `incoming.sender_id == TARGET_NODE_ID` and `incoming.target_id == MY_NODE_ID`.
-- Evaluates incoming sequence counters using signed 32-bit arithmetic to safely handle integer wraparound and reject stale, duplicate, or reordered packets.
-
-### Directional Limit Switch Safety Model (`esp8266_mesh_servo`)
-- **MIN limit switch active (`D6`)**: Forbids further movement toward MIN (`targetUsFp4 < lastSafeUsFp4`), holding `lastSafeUsFp4`, while permitting movement toward MAX (`targetUsFp4 > lastSafeUsFp4`).
-- **MAX limit switch active (`D7`)**: Forbids further movement toward MAX (`targetUsFp4 > lastSafeUsFp4`), holding `lastSafeUsFp4`, while permitting movement toward MIN (`targetUsFp4 < lastSafeUsFp4`).
 
 ---
 
@@ -94,15 +92,16 @@ arduino-cli upload -p /dev/ttyUSB1 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
 
 ```text
 ==================================================
-ESP8266 Bi-directional Servo Mesh Node (Strict Unicast Control)
-My Node ID: 1 -> Target Node ID: 2
+ESP8266 Bi-directional Servo Mesh Node (Session Incarnation Aware)
+My Node ID: 1 (Session: 3849201) -> Target Node ID: 2
 Analog In: A0 (DSP Kahan+Kalman) | Servo Pin: GPIO 5 (D1) [544 - 2400 us]
 Digital In: GPIO 4 (D2) | Digital Out: GPIO 0 (D3)
 Min Limit Pin: GPIO 12 (D6) | Max Limit Pin: GPIO 13 (D7)
 ==================================================
-[DISCOVERY #1] Sent HELLO broadcast for Target Node 2 (State: DISCOVERING)
-[HANDSHAKE] Received HELLO_ACK from Target Node 2 (MeshID: 312847102). Transitioned to CONNECTED.
-[TX #1] Filtered ADC: 512.35 | Target Pulse: 1472.25 us (FP4: 23556) | Unicast Sent: SUCCESS (Dest MeshID: 312847102)
-[RX #1] From Node: 2 | Target Pulse: 1950.12 us (FP4: 31202) | Digital: 1 | Remote MinLim: 0 | Remote MaxLim: 0
+[DISCOVERY #1] Sent HELLO broadcast for Target Node 2 (Session: 3849201)
+[HANDSHAKE] Received HELLO_ACK from Target Node 2 (MeshID: 312847102, Session: 9812402). Transitioned to CONNECTED.
+[SESSION] Established/Reset Target Session ID: 9812402 (Seq Reset to 0)
+[TX #1] Filtered ADC: 512.35 | Target Pulse: 1472.25 us (FP4: 23556) | Unicast Sent: SUCCESS (Session: 3849201)
+[RX #1] From Node: 2 (Session: 9812402) | Target Pulse: 1950.12 us (FP4: 31202) | Digital: 1 | MinLim: 0 | MaxLim: 0
 [SERVO FP4] Requested: 1950.12 us (31202) -> Applied: 1950 us (31202 FP4) | LastSafe: 31202 FP4 (MinLim: 0, MaxLim: 0)
 ```

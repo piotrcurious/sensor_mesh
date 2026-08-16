@@ -1,17 +1,17 @@
 /*
-  ESP8266 Bi-directional Sensor Mesh Node Firmware (Traffic Separated)
+  ESP8266 Bi-directional Sensor Mesh Node Firmware (Session-Incarnation & Unicast Control)
   Uses painlessMesh to create an auto-organizing mesh network.
 
-  Traffic Separation & Discovery Features:
+  Session Incarnation & Sequence Features:
+  - Boot Session Incarnation Token (mySessionId):
+    * Generated upon boot via (ESP.getChipId() ^ micros()).
+    * Included in both Handshake (HELLO/HELLO_ACK) and Data (SensorMessage) frames.
+    * When a new session_id is received from TARGET_NODE_ID, sequence state (lastReceivedSeq)
+      is automatically reset and re-synchronized.
   - CONTROL Traffic vs DISCOVERY Traffic Separation:
     * CONTROL / Sensor payloads are sent EXCLUSIVELY via targeted unicast (mesh.sendSingle).
     * Broadcasts are restricted solely to infrequent HELLO discovery packets during DISCOVERING state.
-    * Eliminates broadcast network congestion / flooding on disconnected or multi-node mesh networks.
   - PeerState Enum: UNKNOWN, DISCOVERING, CONNECTED.
-  - Active Handshake Discovery: sends HELLO broadcast packets independently of sensor motion.
-  - Dynamic Topology Invalidation: on changedConnectionCallback(), checks if targetMeshNodeId
-    remains connected in mesh.getNodeList(). If lost, state resets to DISCOVERING.
-  - Paired Sender Validation & Sequence Verification.
   - High-Precision DSP filtering (Kahan summation, outlier rejection, 1D Kalman filter).
   - Drives PWM pin (D1) and digital output pin (D3).
 */
@@ -39,15 +39,19 @@ Task taskSendSensorData(SEND_INTERVAL_MS, TASK_FOREVER, &sendSensorData);
 // Discovery task (1000 ms retry while DISCOVERING)
 Task taskDiscovery(DISCOVERY_INTERVAL_MS, TASK_FOREVER, &sendHelloDiscovery);
 
-// Peer Discovery State Machine
+// Local Boot Session Incarnation ID
+static uint32_t mySessionId = 0;
+
+// Peer Discovery State Machine & Remote Session Tracking
 static PeerState peerState = PeerState::UNKNOWN;
 static uint32_t targetMeshNodeId = 0; // Discovered painlessMesh uint32_t node ID for TARGET_NODE_ID
+static uint32_t targetSessionId = 0;  // Active boot session ID of TARGET_NODE_ID
 
 // Kalman Filter State
 static float kalman_x = 512.0f; // Estimated value
 static float kalman_p = 1.0f;    // Estimation error covariance
 
-// Sequence tracking (Isolated to TARGET_NODE_ID)
+// Sequence tracking
 static uint32_t messageSequence = 0;
 static uint32_t discoverySequence = 0;
 static uint32_t lastReceivedSeq = 0;
@@ -69,6 +73,16 @@ bool isNewerSequence(uint32_t incoming, uint32_t last) {
         return true;
     }
     return ((int32_t)(incoming - last)) > 0;
+}
+
+/**
+ * Resets target sequence state for a new session incarnation.
+ */
+static void resetSessionSequence(uint32_t newSessionId) {
+    targetSessionId = newSessionId;
+    lastReceivedSeq = 0;
+    hasReceivedFirstPacket = false;
+    Serial.printf("[SESSION] Established/Reset Target Session ID: %u (Seq Reset to 0)\n", newSessionId);
 }
 
 /**
@@ -113,10 +127,13 @@ void setup() {
     Serial.begin(115200);
     delay(500);
 
+    // Generate unique session incarnation token for this boot
+    mySessionId = ESP.getChipId() ^ micros() ^ (uint32_t)random(0xFFFF);
+
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (Strict Unicast Control)\n");
-    Serial.printf("My Node ID: %u -> Target Node ID: %u\n", MY_NODE_ID, TARGET_NODE_ID);
+    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (Session Incarnation Aware)\n");
+    Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | PWM Out: GPIO %d (D1)\n", PWM_PIN);
     Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
     Serial.println("==================================================");
@@ -157,7 +174,6 @@ void loop() {
 
 /**
  * Periodically broadcasts HELLO handshake packets ONLY when state is DISCOVERING / UNKNOWN.
- * Isolates broadcast traffic to infrequent discovery intervals.
  */
 void sendHelloDiscovery() {
     if (peerState == PeerState::CONNECTED) {
@@ -168,6 +184,7 @@ void sendHelloDiscovery() {
     helloMsg.magic = MSG_TYPE_HELLO;
     helloMsg.sender_id = MY_NODE_ID;
     helloMsg.target_id = TARGET_NODE_ID;
+    helloMsg.session_id = mySessionId;
     helloMsg.seq = ++discoverySequence;
 
     const size_t structSize = sizeof(HandshakeMessage);
@@ -182,8 +199,8 @@ void sendHelloDiscovery() {
 
     mesh.sendBroadcast(String(hexBuffer));
 
-    Serial.printf("[DISCOVERY #%u] Sent HELLO broadcast for Target Node %u (State: DISCOVERING)\n",
-                  helloMsg.seq, TARGET_NODE_ID);
+    Serial.printf("[DISCOVERY #%u] Sent HELLO broadcast for Target Node %u (Session: %u)\n",
+                  helloMsg.seq, TARGET_NODE_ID, mySessionId);
 }
 
 /**
@@ -194,6 +211,7 @@ void sendHelloAck(uint32_t destMeshId) {
     ackMsg.magic = MSG_TYPE_HELLO_ACK;
     ackMsg.sender_id = MY_NODE_ID;
     ackMsg.target_id = TARGET_NODE_ID;
+    ackMsg.session_id = mySessionId;
     ackMsg.seq = ++discoverySequence;
 
     const size_t structSize = sizeof(HandshakeMessage);
@@ -209,8 +227,8 @@ void sendHelloAck(uint32_t destMeshId) {
     String payload(hexBuffer);
     mesh.sendSingle(destMeshId, payload);
 
-    Serial.printf("[DISCOVERY #%u] Sent HELLO_ACK to Target Node %u (MeshID: %u)\n",
-                  ackMsg.seq, TARGET_NODE_ID, destMeshId);
+    Serial.printf("[DISCOVERY #%u] Sent HELLO_ACK to Target Node %u (MeshID: %u, Session: %u)\n",
+                  ackMsg.seq, TARGET_NODE_ID, destMeshId, mySessionId);
 }
 
 /**
@@ -232,6 +250,7 @@ void sendSensorData() {
     msg.magic = MSG_TYPE_DATA;
     msg.sender_id = MY_NODE_ID;
     msg.target_id = TARGET_NODE_ID;
+    msg.session_id = mySessionId;
     msg.sensor_value = highResSensorVal;
     msg.digital_value = digitalVal;
     msg.seq = ++messageSequence;
@@ -251,14 +270,14 @@ void sendSensorData() {
     // Strict Unicast CONTROL Transmission
     bool sentDirect = mesh.sendSingle(targetMeshNodeId, payload);
 
-    Serial.printf("[TX #%u] Filtered ADC: %.2f (Val: %u) | Digital D2: %u | Unicast Sent: %s (Dest MeshID: %u)\n",
+    Serial.printf("[TX #%u] Filtered ADC: %.2f (Val: %u) | Digital D2: %u | Unicast Sent: %s (Session: %u)\n",
                   msg.seq, filteredVal, highResSensorVal, digitalVal,
-                  sentDirect ? "SUCCESS" : "FAILED", targetMeshNodeId);
+                  sentDirect ? "SUCCESS" : "FAILED", mySessionId);
 }
 
 /**
  * Callback when a mesh message is received.
- * Handles HELLO / HELLO_ACK discovery and DATA messages.
+ * Handles HELLO / HELLO_ACK discovery and DATA messages with session incarnation tracking.
  */
 void receivedCallback(uint32_t from, String &msg) {
     // 1. Check for Handshake Messages (HELLO / HELLO_ACK)
@@ -275,14 +294,16 @@ void receivedCallback(uint32_t from, String &msg) {
             if (handshake.magic == MSG_TYPE_HELLO) {
                 targetMeshNodeId = from;
                 peerState = PeerState::CONNECTED;
-                Serial.printf("[HANDSHAKE] Received HELLO from Target Node %u (MeshID: %u). Transitioned to CONNECTED.\n",
-                              TARGET_NODE_ID, from);
+                resetSessionSequence(handshake.session_id);
+                Serial.printf("[HANDSHAKE] Received HELLO from Target Node %u (MeshID: %u, Session: %u). Transitioned to CONNECTED.\n",
+                              TARGET_NODE_ID, from, handshake.session_id);
                 sendHelloAck(from);
             } else if (handshake.magic == MSG_TYPE_HELLO_ACK) {
                 targetMeshNodeId = from;
                 peerState = PeerState::CONNECTED;
-                Serial.printf("[HANDSHAKE] Received HELLO_ACK from Target Node %u (MeshID: %u). Transitioned to CONNECTED.\n",
-                              TARGET_NODE_ID, from);
+                resetSessionSequence(handshake.session_id);
+                Serial.printf("[HANDSHAKE] Received HELLO_ACK from Target Node %u (MeshID: %u, Session: %u). Transitioned to CONNECTED.\n",
+                              TARGET_NODE_ID, from, handshake.session_id);
             }
         }
         return;
@@ -311,17 +332,19 @@ void receivedCallback(uint32_t from, String &msg) {
         return;
     }
 
-    // Auto-discover / verify target mesh ID
+    // Auto-discover / verify target mesh ID & check session incarnation change
     targetMeshNodeId = from;
-    if (peerState != PeerState::CONNECTED) {
+    if (peerState != PeerState::CONNECTED || incoming.session_id != targetSessionId) {
         peerState = PeerState::CONNECTED;
-        Serial.printf("[STATE] Learned Target MeshID %u from DATA payload. Transitioned to CONNECTED.\n", from);
+        resetSessionSequence(incoming.session_id);
+        Serial.printf("[STATE] Synchronized Target MeshID %u with new Session ID %u. Transitioned to CONNECTED.\n",
+                      from, incoming.session_id);
     }
 
-    // Single-source sequence check
+    // Single-source sequence check for active session
     if (!isNewerSequence(incoming.seq, lastReceivedSeq)) {
-        Serial.printf("[RX DROP #%u] Out-of-order or duplicate packet dropped (Last Seq: %u, From Sender: %u, MeshID: %u)\n",
-                      incoming.seq, lastReceivedSeq, incoming.sender_id, from);
+        Serial.printf("[RX DROP #%u] Out-of-order or duplicate packet dropped (Last Seq: %u, Sender Session: %u)\n",
+                      incoming.seq, lastReceivedSeq, incoming.session_id);
         return;
     }
 
@@ -339,8 +362,8 @@ void receivedCallback(uint32_t from, String &msg) {
     uint8_t digitalState = incoming.digital_value ? HIGH : LOW;
     digitalWrite(DIGITAL_OUTPUT_PIN, digitalState);
 
-    Serial.printf("[RX #%u] From Node: %u | Analog: %u -> PWM Duty: %u/%d | Digital D2 -> D3: %u (Mesh NodeID: %u)\n",
-                  incoming.seq, incoming.sender_id, incoming.sensor_value, pwmValue, PWM_RANGE, digitalState, from);
+    Serial.printf("[RX #%u] From Node: %u (Session: %u) | Analog: %u -> PWM Duty: %u/%d | Digital D2 -> D3: %u (Mesh NodeID: %u)\n",
+                  incoming.seq, incoming.sender_id, incoming.session_id, incoming.sensor_value, pwmValue, PWM_RANGE, digitalState, from);
 }
 
 void newConnectionCallback(uint32_t nodeId) {
