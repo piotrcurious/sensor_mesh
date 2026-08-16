@@ -1,6 +1,6 @@
 # ESP8266 Bi-Directional Sensor & Servo Mesh (DSP Enhanced)
 
-An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring sequence verification, unicast transport optimization, high-precision Digital Signal Processing (DSP) for analog inputs, sub-microsecond fixed-point resolution, directional limit switch protection, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
+An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring paired-sender packet filtering, sequence verification, unicast transport optimization, high-precision Digital Signal Processing (DSP) for analog inputs, sub-microsecond fixed-point resolution, directional limit switch protection, microsecond-level actuator control, and network rate limiting. This repository provides two firmware variants:
 
 1. **`esp8266_mesh_pair`**: PWM & Digital IO version (transmits 1/sec periodic updates).
 2. **`esp8266_mesh_servo`**: Servo version (50ms input polling, 200ms network rate limiting, sub-microsecond FP4 fixed-point pulse transmission, directional limit switch safety clamping).
@@ -16,7 +16,7 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 | **Input Polling Rate** | 1000 ms (1 Hz) | 50 ms (20 Hz local sampling, Wi-Fi PHY safe) |
 | **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Rate-limited (max 1 packet per 200 ms / 5 Hz) |
 | **Mesh Transport Mode** | Unicast `sendSingle()` (with broadcast discovery fallback) | Unicast `sendSingle()` (with broadcast discovery fallback) |
-| **Packet Sequence Verification**| Wraparound-safe 32-bit sequence tracking & out-of-order rejection | Wraparound-safe 32-bit sequence tracking & out-of-order rejection |
+| **Sender Filtering & Sequence** | Paired sender validation (`sender_id == TARGET_NODE_ID`) & wraparound sequence tracking | Paired sender validation (`sender_id == TARGET_NODE_ID`) & wraparound sequence tracking |
 | **Analog Input Processing** | Kahan Oversampling + Single Min/Max Outlier Rejection + 1D Kalman Filter | Kahan Oversampling + Single Min/Max Outlier Rejection + 1D Kalman Filter |
 | **Actuator Drive Resolution**| PWM Output on `D1` (GPIO 5, 0-1023) | Sub-microsecond FP4 Fixed-Point (1/16th $\mu s$) via `writeMicroseconds()` |
 | **Digital IO Pin** | `D2` In $\rightarrow$ `D3` Out | `D2` In $\rightarrow$ `D3` Out |
@@ -28,15 +28,15 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ## 2. Unicast Routing, Sequence Control & Directional Safety
 
-### Unicast `sendSingle()` Routing Optimization & Node ID Mapping
+### Paired Sender Filtering & Sequence Tracking
+- Filters incoming packets to explicitly enforce `incoming.sender_id == TARGET_NODE_ID` and `incoming.target_id == MY_NODE_ID`.
+- Isolates single-source sequence tracking (`isNewerSequence`) exclusively to the paired node, preventing sequence state corruption or false drops if un-paired nodes exist on the same mesh.
+- Evaluates incoming sequence counters using signed 32-bit arithmetic to safely handle integer wraparound and reject stale, duplicate, or reordered packets.
+
+### Unicast `sendSingle()` Routing Optimization
 - Maps logical application IDs (`MY_NODE_ID`, `TARGET_NODE_ID`) to transport-level painlessMesh 32-bit node IDs (`mesh.getNodeId()`).
 - Automatically learns the paired node's transport ID upon receiving incoming packets.
 - Transmits using targeted unicast `mesh.sendSingle(targetMeshNodeId, payload)` once connected, drastically reducing mesh channel saturation compared to broadcast flooding.
-
-### Wraparound-Safe Sequence Tracking
-- Transmits an incrementing 32-bit sequence counter (`seq`).
-- Evaluates incoming packets using signed 32-bit arithmetic (`isNewerSequence`).
-- Drops old, duplicate, or reordered packets to prevent backward jumping or actuator jitter.
 
 ### Sub-Microsecond FP4 Fixed-Point Resolution
 - Target pulse durations are represented in fixed-point **FP4 units** ($1\text{ unit} = 1/16\text{th }\mu s$).

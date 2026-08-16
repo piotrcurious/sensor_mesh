@@ -1,15 +1,15 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Unicast, Sequence Checking & Directional Safety)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Sender-Validated Unicast & Sequence Tracking)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Enhancements:
-  - Sequence Tracking & Out-of-Order Rejection:
-    * Implements wraparound-safe sequence comparison (isNewerSequence).
-    * Rejects stale, duplicate, or reordered packets to prevent servo jitter / backward jumps.
+  - Explicit Paired Sender Validation & Single-Source Sequence Verification:
+    * Rejects packets unless incoming.sender_id == TARGET_NODE_ID AND incoming.target_id == MY_NODE_ID.
+    * Ensures the single sequence tracking state (isNewerSequence) is logically isolated to the paired sender.
+    * Prevents sequence corruption or packet rejection from un-paired mesh nodes.
   - Unicast Mesh Transport & Dynamic Target Discovery:
     * Dynamically maps logical TARGET_NODE_ID to painlessMesh uint32_t transport node ID.
-    * Uses targeted mesh.sendSingle(targetMeshNodeId, payload) for direct unicast transport when connected,
-      falling back to mesh.sendBroadcast(payload) during initial discovery.
+    * Uses targeted mesh.sendSingle(targetMeshNodeId, payload) for direct unicast transport when connected.
   - Sub-microsecond Fixed-Point Precision (FP4 = 1/16th us resolution).
   - Wi-Fi PHY & Mesh connection stability (yield-friendly ADC oversampling).
   - Directional limit switch safety clamping.
@@ -49,7 +49,7 @@ static uint8_t  lastMaxLimit = 0xFF;
 static uint32_t lastTxTime = 0;
 static uint32_t messageSequence = 0;
 
-// Sequence verification and dynamic target painlessMesh Node ID mapping
+// Sequence verification and dynamic target painlessMesh Node ID mapping (Isolated to TARGET_NODE_ID)
 static uint32_t lastReceivedSeq = 0;
 static bool     hasReceivedFirstPacket = false;
 static uint32_t targetMeshNodeId = 0; // Discovered painlessMesh uint32_t node ID for TARGET_NODE_ID
@@ -276,7 +276,7 @@ void updateLocalServoFp4(uint16_t newRequestedUsFp4) {
 
 /**
  * Callback when a mesh message is received.
- * Enforces wraparound-safe sequence checking and maps target painlessMesh transport node ID.
+ * Explicitly validates both sender_id and target_id before sequence checking.
  */
 void receivedCallback(uint32_t from, String &msg) {
     const size_t expectedStructSize = sizeof(ServoMeshMessage);
@@ -299,36 +299,34 @@ void receivedCallback(uint32_t from, String &msg) {
         return;
     }
 
-    // Check if message is addressed to this node
-    if (incoming.target_id == MY_NODE_ID) {
-        // Automatically learn target's transport painlessMesh Node ID
-        if (incoming.sender_id == TARGET_NODE_ID) {
-            targetMeshNodeId = from;
-        }
-
-        // Sequence check: reject stale, duplicate, or reordered packets
-        if (!isNewerSequence(incoming.seq, lastReceivedSeq)) {
-            Serial.printf("[RX DROP #%u] Out-of-order or duplicate packet dropped (Last Seq: %u, From MeshID: %u)\n",
-                          incoming.seq, lastReceivedSeq, from);
-            return;
-        }
-
-        lastReceivedSeq = incoming.seq;
-        hasReceivedFirstPacket = true;
-
-        // Update local digital output (D3)
-        digitalWrite(DIGITAL_OUTPUT_PIN, incoming.digital_value ? HIGH : LOW);
-
-        // Update local servo
-        updateLocalServoFp4(incoming.target_us_fp4);
-
-        Serial.printf("[RX #%u] From Node: %u | Target Pulse: %.2f us (%u FP4) | Digital: %u | Remote MinLim: %u | Remote MaxLim: %u\n",
-                      incoming.seq, incoming.sender_id, (float)incoming.target_us_fp4 / 16.0f, incoming.target_us_fp4,
-                      incoming.digital_value, incoming.min_limit_active, incoming.max_limit_active);
-    } else {
-        Serial.printf("[RELAY] From Node: %u to Target Node: %u (relayed via %u)\n",
-                      incoming.sender_id, incoming.target_id, from);
+    // Explicit Sender & Target Validation:
+    // Only accept messages originating from compile-time TARGET_NODE_ID addressed to MY_NODE_ID
+    if (incoming.sender_id != TARGET_NODE_ID || incoming.target_id != MY_NODE_ID) {
+        return;
     }
+
+    // Automatically learn/update target's transport painlessMesh Node ID
+    targetMeshNodeId = from;
+
+    // Single-source sequence check: reject stale, duplicate, or reordered packets from paired sender
+    if (!isNewerSequence(incoming.seq, lastReceivedSeq)) {
+        Serial.printf("[RX DROP #%u] Out-of-order or duplicate packet dropped (Last Seq: %u, From Sender: %u, MeshID: %u)\n",
+                      incoming.seq, lastReceivedSeq, incoming.sender_id, from);
+        return;
+    }
+
+    lastReceivedSeq = incoming.seq;
+    hasReceivedFirstPacket = true;
+
+    // Update local digital output (D3)
+    digitalWrite(DIGITAL_OUTPUT_PIN, incoming.digital_value ? HIGH : LOW);
+
+    // Update local servo
+    updateLocalServoFp4(incoming.target_us_fp4);
+
+    Serial.printf("[RX #%u] From Node: %u | Target Pulse: %.2f us (%u FP4) | Digital: %u | Remote MinLim: %u | Remote MaxLim: %u\n",
+                  incoming.seq, incoming.sender_id, (float)incoming.target_us_fp4 / 16.0f, incoming.target_us_fp4,
+                  incoming.digital_value, incoming.min_limit_active, incoming.max_limit_active);
 }
 
 void newConnectionCallback(uint32_t nodeId) {

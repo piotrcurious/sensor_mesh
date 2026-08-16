@@ -1,15 +1,14 @@
 /*
-  ESP8266 Bi-directional Sensor Mesh Node Firmware (Unicast & Sequence Checking)
+  ESP8266 Bi-directional Sensor Mesh Node Firmware (Sender-Validated Unicast & Sequence Tracking)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Enhancements:
-  - Sequence Tracking & Out-of-Order Rejection:
-    * Implements wraparound-safe sequence comparison (isNewerSequence).
-    * Rejects stale, duplicate, or reordered packets.
+  - Explicit Paired Sender Validation & Single-Source Sequence Verification:
+    * Rejects packets unless incoming.sender_id == TARGET_NODE_ID AND incoming.target_id == MY_NODE_ID.
+    * Ensures the single sequence tracking state (isNewerSequence) is logically isolated to the paired sender.
   - Unicast Mesh Transport & Dynamic Target Discovery:
     * Dynamically maps logical TARGET_NODE_ID to painlessMesh uint32_t transport node ID.
-    * Uses targeted mesh.sendSingle(targetMeshNodeId, payload) for direct unicast transport when connected,
-      falling back to mesh.sendBroadcast(payload) during initial discovery.
+    * Uses targeted mesh.sendSingle(targetMeshNodeId, payload) for direct unicast transport when connected.
   - High-Precision DSP filtering (Kahan summation, outlier rejection, 1D Kalman filter).
   - Drives PWM pin (D1) and digital output pin (D3).
 */
@@ -37,7 +36,7 @@ Task taskSendSensorData(SEND_INTERVAL_MS, TASK_FOREVER, &sendSensorData);
 static float kalman_x = 512.0f; // Estimated value
 static float kalman_p = 1.0f;    // Estimation error covariance
 
-// Sequence tracking
+// Sequence tracking (Isolated to TARGET_NODE_ID)
 static uint32_t messageSequence = 0;
 static uint32_t lastReceivedSeq = 0;
 static bool     hasReceivedFirstPacket = false;
@@ -187,6 +186,7 @@ void sendSensorData() {
 
 /**
  * Callback when a mesh message is received.
+ * Explicitly validates both sender_id and target_id before sequence checking.
  */
 void receivedCallback(uint32_t from, String &msg) {
     const size_t expectedStructSize = sizeof(SensorMessage);
@@ -209,39 +209,38 @@ void receivedCallback(uint32_t from, String &msg) {
         return;
     }
 
-    if (incoming.target_id == MY_NODE_ID) {
-        // Automatically learn target's transport painlessMesh Node ID
-        if (incoming.sender_id == TARGET_NODE_ID) {
-            targetMeshNodeId = from;
-        }
-
-        // Sequence check: reject stale, duplicate, or reordered packets
-        if (!isNewerSequence(incoming.seq, lastReceivedSeq)) {
-            Serial.printf("[RX DROP #%u] Out-of-order or duplicate packet dropped (Last Seq: %u, From MeshID: %u)\n",
-                          incoming.seq, lastReceivedSeq, from);
-            return;
-        }
-
-        lastReceivedSeq = incoming.seq;
-        hasReceivedFirstPacket = true;
-
-        // Map sensor value (0-1023) to PWM range
-        uint16_t pwmValue = incoming.sensor_value;
-        if (pwmValue > PWM_RANGE) {
-            pwmValue = PWM_RANGE;
-        }
-
-        analogWrite(PWM_PIN, pwmValue);
-
-        uint8_t digitalState = incoming.digital_value ? HIGH : LOW;
-        digitalWrite(DIGITAL_OUTPUT_PIN, digitalState);
-
-        Serial.printf("[RX #%u] From Node: %u | Analog: %u -> PWM Duty: %u/%d | Digital D2 -> D3: %u (Mesh NodeID: %u)\n",
-                      incoming.seq, incoming.sender_id, incoming.sensor_value, pwmValue, PWM_RANGE, digitalState, from);
-    } else {
-        Serial.printf("[RELAY] From Node: %u to Target Node: %u (relayed via mesh node %u)\n",
-                      incoming.sender_id, incoming.target_id, from);
+    // Explicit Sender & Target Validation:
+    // Only accept messages originating from compile-time TARGET_NODE_ID addressed to MY_NODE_ID
+    if (incoming.sender_id != TARGET_NODE_ID || incoming.target_id != MY_NODE_ID) {
+        return;
     }
+
+    // Automatically learn/update target's transport painlessMesh Node ID
+    targetMeshNodeId = from;
+
+    // Single-source sequence check: reject stale, duplicate, or reordered packets from paired sender
+    if (!isNewerSequence(incoming.seq, lastReceivedSeq)) {
+        Serial.printf("[RX DROP #%u] Out-of-order or duplicate packet dropped (Last Seq: %u, From Sender: %u, MeshID: %u)\n",
+                      incoming.seq, lastReceivedSeq, incoming.sender_id, from);
+        return;
+    }
+
+    lastReceivedSeq = incoming.seq;
+    hasReceivedFirstPacket = true;
+
+    // Map sensor value (0-1023) to PWM range
+    uint16_t pwmValue = incoming.sensor_value;
+    if (pwmValue > PWM_RANGE) {
+        pwmValue = PWM_RANGE;
+    }
+
+    analogWrite(PWM_PIN, pwmValue);
+
+    uint8_t digitalState = incoming.digital_value ? HIGH : LOW;
+    digitalWrite(DIGITAL_OUTPUT_PIN, digitalState);
+
+    Serial.printf("[RX #%u] From Node: %u | Analog: %u -> PWM Duty: %u/%d | Digital D2 -> D3: %u (Mesh NodeID: %u)\n",
+                  incoming.seq, incoming.sender_id, incoming.sensor_value, pwmValue, PWM_RANGE, digitalState, from);
 }
 
 void newConnectionCallback(uint32_t nodeId) {
