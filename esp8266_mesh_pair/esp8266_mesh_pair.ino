@@ -1,12 +1,14 @@
 /*
-  ESP8266 Bi-directional Sensor Mesh Node Firmware (Discovery State Machine & Direct Unicast)
+  ESP8266 Bi-directional Sensor Mesh Node Firmware (Traffic Separated)
   Uses painlessMesh to create an auto-organizing mesh network.
 
-  Peer Discovery & Handshake Features:
+  Traffic Separation & Discovery Features:
+  - CONTROL Traffic vs DISCOVERY Traffic Separation:
+    * CONTROL / Sensor payloads are sent EXCLUSIVELY via targeted unicast (mesh.sendSingle).
+    * Broadcasts are restricted solely to infrequent HELLO discovery packets during DISCOVERING state.
+    * Eliminates broadcast network congestion / flooding on disconnected or multi-node mesh networks.
   - PeerState Enum: UNKNOWN, DISCOVERING, CONNECTED.
-  - Active Handshake Discovery: sends HELLO broadcast packets independently of sensor motion
-    until target node is discovered via HELLO / HELLO_ACK exchange.
-  - Unicast Mesh Transport (sendSingle) once CONNECTED.
+  - Active Handshake Discovery: sends HELLO broadcast packets independently of sensor motion.
   - Dynamic Topology Invalidation: on changedConnectionCallback(), checks if targetMeshNodeId
     remains connected in mesh.getNodeList(). If lost, state resets to DISCOVERING.
   - Paired Sender Validation & Sequence Verification.
@@ -113,7 +115,7 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (DSP Enhanced)\n");
+    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (Strict Unicast Control)\n");
     Serial.printf("My Node ID: %u -> Target Node ID: %u\n", MY_NODE_ID, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | PWM Out: GPIO %d (D1)\n", PWM_PIN);
     Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
@@ -154,7 +156,8 @@ void loop() {
 }
 
 /**
- * Periodically broadcasts HELLO handshake packets when state is DISCOVERING / UNKNOWN.
+ * Periodically broadcasts HELLO handshake packets ONLY when state is DISCOVERING / UNKNOWN.
+ * Isolates broadcast traffic to infrequent discovery intervals.
  */
 void sendHelloDiscovery() {
     if (peerState == PeerState::CONNECTED) {
@@ -204,9 +207,7 @@ void sendHelloAck(uint32_t destMeshId) {
     hexBuffer[hexLen] = '\0';
 
     String payload(hexBuffer);
-    if (!mesh.sendSingle(destMeshId, payload)) {
-        mesh.sendBroadcast(payload);
-    }
+    mesh.sendSingle(destMeshId, payload);
 
     Serial.printf("[DISCOVERY #%u] Sent HELLO_ACK to Target Node %u (MeshID: %u)\n",
                   ackMsg.seq, TARGET_NODE_ID, destMeshId);
@@ -214,13 +215,18 @@ void sendHelloAck(uint32_t destMeshId) {
 
 /**
  * Reads DSP-filtered analog input and digital input, packs into binary struct,
- * hex-encodes it, and sends via targeted sendSingle or broadcast fallback.
+ * hex-encodes it, and sends CONTROL payload EXCLUSIVELY via targeted UNICAST (sendSingle).
  */
 void sendSensorData() {
     float filteredVal = readAnalogFiltered();
     uint16_t highResSensorVal = (uint16_t)constrain((int)roundf(filteredVal), 0, 1023);
 
     uint8_t digitalVal = digitalRead(DIGITAL_INPUT_PIN);
+
+    // Suppress CONTROL packet transmission unless CONNECTED to target node
+    if (peerState != PeerState::CONNECTED || targetMeshNodeId == 0 || !mesh.isConnected(targetMeshNodeId)) {
+        return;
+    }
 
     SensorMessage msg;
     msg.magic = MSG_TYPE_DATA;
@@ -242,19 +248,12 @@ void sendSensorData() {
 
     String payload(hexBuffer);
 
-    bool sentDirect = false;
-    if (peerState == PeerState::CONNECTED && targetMeshNodeId != 0 && mesh.isConnected(targetMeshNodeId)) {
-        sentDirect = mesh.sendSingle(targetMeshNodeId, payload);
-    }
+    // Strict Unicast CONTROL Transmission
+    bool sentDirect = mesh.sendSingle(targetMeshNodeId, payload);
 
-    if (!sentDirect) {
-        mesh.sendBroadcast(payload);
-    }
-
-    Serial.printf("[TX #%u] Filtered ADC: %.2f (Val: %u) | Digital D2: %u | Transport: %s (Dest MeshID: %u, State: %s)\n",
+    Serial.printf("[TX #%u] Filtered ADC: %.2f (Val: %u) | Digital D2: %u | Unicast Sent: %s (Dest MeshID: %u)\n",
                   msg.seq, filteredVal, highResSensorVal, digitalVal,
-                  sentDirect ? "UNICAST (sendSingle)" : "BROADCAST", targetMeshNodeId,
-                  peerState == PeerState::CONNECTED ? "CONNECTED" : "DISCOVERING");
+                  sentDirect ? "SUCCESS" : "FAILED", targetMeshNodeId);
 }
 
 /**

@@ -1,12 +1,14 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Discovery State Machine & Direct Unicast)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Traffic Separated)
   Uses painlessMesh to create an auto-organizing mesh network.
 
-  Peer Discovery & Handshake Features:
+  Traffic Separation & Discovery Features:
+  - CONTROL Traffic vs DISCOVERY Traffic Separation:
+    * CONTROL / Sensor payloads are sent EXCLUSIVELY via targeted unicast (mesh.sendSingle).
+    * Broadcasts are restricted solely to infrequent HELLO discovery packets during DISCOVERING state.
+    * Eliminates broadcast network congestion / flooding on disconnected or multi-node mesh networks.
   - PeerState Enum: UNKNOWN, DISCOVERING, CONNECTED.
-  - Active Handshake Discovery: sends HELLO broadcast packets independently of sensor motion
-    until target node is discovered via HELLO / HELLO_ACK exchange.
-  - Unicast Mesh Transport (sendSingle) once CONNECTED.
+  - Active Handshake Discovery: sends HELLO broadcast packets independently of sensor motion.
   - Dynamic Topology Invalidation: on changedConnectionCallback(), checks if targetMeshNodeId
     remains connected in mesh.getNodeList(). If lost, state resets to DISCOVERING.
   - Paired Sender Validation & Sequence Verification.
@@ -128,7 +130,7 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Servo Mesh Node\n");
+    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Strict Unicast Control)\n");
     Serial.printf("My Node ID: %u -> Target Node ID: %u\n", MY_NODE_ID, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
                   SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
@@ -175,7 +177,8 @@ void loop() {
 }
 
 /**
- * Periodically broadcasts HELLO handshake packets when state is DISCOVERING / UNKNOWN.
+ * Periodically broadcasts HELLO handshake packets ONLY when state is DISCOVERING / UNKNOWN.
+ * Isolates broadcast traffic to infrequent discovery intervals.
  */
 void sendHelloDiscovery() {
     if (peerState == PeerState::CONNECTED) {
@@ -225,17 +228,15 @@ void sendHelloAck(uint32_t destMeshId) {
     hexBuffer[hexLen] = '\0';
 
     String payload(hexBuffer);
-    if (!mesh.sendSingle(destMeshId, payload)) {
-        mesh.sendBroadcast(payload);
-    }
+    mesh.sendSingle(destMeshId, payload);
 
     Serial.printf("[DISCOVERY #%u] Sent HELLO_ACK to Target Node %u (MeshID: %u)\n",
                   ackMsg.seq, TARGET_NODE_ID, destMeshId);
 }
 
 /**
- * Polls inputs and transmits data packet.
- * Uses unicast sendSingle() if CONNECTED, falling back to broadcast during discovery.
+ * Polls inputs and transmits CONTROL payload data EXCLUSIVELY via targeted UNICAST (sendSingle).
+ * If disconnected, control data is suppressed until peer discovery establishes connection.
  */
 void checkAndTransmitInputs() {
     float filteredAdc = readAnalogFiltered();
@@ -254,6 +255,11 @@ void checkAndTransmitInputs() {
 
     if (currentMinLimit != lastMinLimit || currentMaxLimit != lastMaxLimit) {
         updateLocalServoFp4(requestedServoUsFp4);
+    }
+
+    // Suppress CONTROL packet transmission unless CONNECTED to target node
+    if (peerState != PeerState::CONNECTED || targetMeshNodeId == 0 || !mesh.isConnected(targetMeshNodeId)) {
+        return;
     }
 
     bool pulseChanged = (abs((int)currentUsFp4 - (int)lastTransmittedUsFp4) >= PULSE_FP4_CHANGE_THRESHOLD);
@@ -289,14 +295,8 @@ void checkAndTransmitInputs() {
 
         String payload(hexBuffer);
 
-        bool sentDirect = false;
-        if (peerState == PeerState::CONNECTED && targetMeshNodeId != 0 && mesh.isConnected(targetMeshNodeId)) {
-            sentDirect = mesh.sendSingle(targetMeshNodeId, payload);
-        }
-
-        if (!sentDirect) {
-            mesh.sendBroadcast(payload);
-        }
+        // Strict Unicast CONTROL Transmission
+        bool sentDirect = mesh.sendSingle(targetMeshNodeId, payload);
 
         lastTransmittedUsFp4 = currentUsFp4;
         lastDigitalVal = currentDigital;
@@ -304,10 +304,9 @@ void checkAndTransmitInputs() {
         lastMaxLimit = currentMaxLimit;
         lastTxTime = now;
 
-        Serial.printf("[TX #%u] Filtered ADC: %.2f | Target Pulse: %.2f us (FP4: %u) | Transport: %s (Dest MeshID: %u, State: %s)\n",
+        Serial.printf("[TX #%u] Filtered ADC: %.2f | Target Pulse: %.2f us (FP4: %u) | Unicast Sent: %s (Dest MeshID: %u)\n",
                       msg.seq, filteredAdc, (float)currentUsFp4 / 16.0f, currentUsFp4,
-                      sentDirect ? "UNICAST (sendSingle)" : "BROADCAST", targetMeshNodeId,
-                      peerState == PeerState::CONNECTED ? "CONNECTED" : "DISCOVERING");
+                      sentDirect ? "SUCCESS" : "FAILED", targetMeshNodeId);
     }
 }
 
