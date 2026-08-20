@@ -1,23 +1,17 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Hardened PeerSession Tuple Validation & Sticky Alarm)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Siren Sound Output Enabled)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Hardening Enhancements:
+  - Non-blocking Siren Audio Output:
+    * #define ENABLE_SIREN_OUTPUT option in config.h.
+    * When ENABLE_SIREN_OUTPUT is defined and DIGITAL_OUTPUT_PIN (D3) is HIGH,
+      modulates a sweeping dual-tone siren sound on SIREN_PIN (D4 / GPIO 2) non-blockingly.
+    * When DIGITAL_OUTPUT_PIN is LOW, silences SIREN_PIN via noTone(SIREN_PIN).
   - Sticky Digital Output Latching & Reset Pin:
-    * #define LATCH_DIGITAL_OUTPUT_HIGH option in config.h.
-    * When LATCH_DIGITAL_OUTPUT_HIGH is defined, receiving a HIGH digital input state latches
-      DIGITAL_OUTPUT_PIN to HIGH permanently until RESET_ALARM_PIN (D5) is pulled LOW.
-    * When RESET_ALARM_PIN is pulled LOW (active LOW button/switch), latched alarm memory resets
-      and DIGITAL_OUTPUT_PIN is forced to LOW immediately.
-  - PeerSession Tuple Validation:
-    * Replaces scalar variables with a unified PeerSession state structure:
-      (meshNodeId, senderId, sessionId, lastDataSeq, lastHelloSeq, state).
-  - Handshake Non-Reset Protection:
-    * Duplicate HELLO / HELLO_ACK frames within the same session DO NOT reset lastDataSeq.
-  - Strict DATA Frame Validation:
-    * DATA frames are validated against the complete PeerSession tuple.
+    * #define LATCH_DIGITAL_OUTPUT_HIGH option in config.h with RESET_ALARM_PIN (D5).
+  - PeerSession Tuple Validation & Handshake-Only Sessions.
   - Fast Local Lookup Table (LUT) Hex Encoder / Decoder & CRC-16 Checksum.
-  - Zero Heap Allocation Strategy (static reserved txPayloadString).
   - Sub-microsecond Fixed-Point Precision (FP4 = 1/16th us resolution).
   - Directional limit switch safety clamping.
 */
@@ -34,6 +28,7 @@ Servo myServo;
 // Function declarations
 void checkAndTransmitInputs();
 void sendHelloDiscovery();
+void updateSirenAudio();
 void receivedCallback(uint32_t from, String &msg);
 void newConnectionCallback(uint32_t nodeId);
 void changedConnectionCallback();
@@ -51,11 +46,18 @@ Task taskPollInputs(POLL_INTERVAL_MS, TASK_FOREVER, &checkAndTransmitInputs);
 // Discovery task (1000 ms retry while DISCOVERING)
 Task taskDiscovery(DISCOVERY_INTERVAL_MS, TASK_FOREVER, &sendHelloDiscovery);
 
+// Siren Modulation Task (10 ms tick for non-blocking sweeping audio)
+Task taskSiren(SIREN_TICK_MS, TASK_FOREVER, &updateSirenAudio);
+
 // Local Boot Session Incarnation ID
 static uint32_t mySessionId = 0;
 
 // Latched digital output memory state (for sticky alarm mode)
 static bool latchedDigitalOutputState = false;
+
+// Siren Audio State Tracking
+static uint16_t currentSirenFreq = SIREN_FREQ_LOW;
+static bool     sirenSweepRising  = true;
 
 // Unified PeerSession State Structure
 struct PeerSession {
@@ -152,6 +154,37 @@ bool hexToBytes(const String& hexStr, uint8_t* dest, size_t destLen) {
 }
 
 /**
+ * Non-blocking Siren Audio Generator:
+ * Modulates sweeping tone frequency on SIREN_PIN whenever DIGITAL_OUTPUT_PIN is HIGH.
+ */
+void updateSirenAudio() {
+#ifdef ENABLE_SIREN_OUTPUT
+    if (digitalRead(DIGITAL_OUTPUT_PIN) == HIGH) {
+        if (sirenSweepRising) {
+            currentSirenFreq += SIREN_STEP_HZ;
+            if (currentSirenFreq >= SIREN_FREQ_HIGH) {
+                currentSirenFreq = SIREN_FREQ_HIGH;
+                sirenSweepRising = false;
+            }
+        } else {
+            if (currentSirenFreq <= SIREN_FREQ_LOW + SIREN_STEP_HZ) {
+                currentSirenFreq = SIREN_FREQ_LOW;
+                sirenSweepRising = true;
+            } else {
+                currentSirenFreq -= SIREN_STEP_HZ;
+            }
+        }
+        tone(SIREN_PIN, currentSirenFreq);
+    } else {
+        noTone(SIREN_PIN);
+        digitalWrite(SIREN_PIN, LOW);
+        currentSirenFreq = SIREN_FREQ_LOW;
+        sirenSweepRising = true;
+    }
+#endif
+}
+
+/**
  * Wraparound-safe 32-bit sequence comparison.
  */
 bool isNewerSequence(uint32_t incoming, uint32_t last, bool initialized) {
@@ -233,17 +266,23 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Sticky Alarm Capable)\n");
+    Serial.printf("ESP8266 Bi-directional Servo Mesh Node\n");
     Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (Adaptive Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
                   SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
-    Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
+    Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3) | Siren Pin: GPIO %d (D4)\n",
+                  DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN, SIREN_PIN);
     Serial.printf("Min Limit Pin: GPIO %d (D6) | Max Limit Pin: GPIO %d (D7) | Reset Alarm Pin: GPIO %d (D5)\n",
                   MIN_LIMIT_PIN, MAX_LIMIT_PIN, RESET_ALARM_PIN);
 #ifdef LATCH_DIGITAL_OUTPUT_HIGH
     Serial.println("Option: LATCH_DIGITAL_OUTPUT_HIGH ENABLED (Sticky Alarm Mode)");
 #else
     Serial.println("Option: LATCH_DIGITAL_OUTPUT_HIGH DISABLED (Standard Mirroring)");
+#endif
+#ifdef ENABLE_SIREN_OUTPUT
+    Serial.println("Option: ENABLE_SIREN_OUTPUT ENABLED (Siren Audio on D4 when D3 HIGH)");
+#else
+    Serial.println("Option: ENABLE_SIREN_OUTPUT DISABLED");
 #endif
     Serial.println("==================================================");
 
@@ -252,6 +291,9 @@ void setup() {
     pinMode(DIGITAL_INPUT_PIN, INPUT_PULLUP);
     pinMode(DIGITAL_OUTPUT_PIN, OUTPUT);
     digitalWrite(DIGITAL_OUTPUT_PIN, LOW);
+
+    pinMode(SIREN_PIN, OUTPUT);
+    digitalWrite(SIREN_PIN, LOW);
 
     pinMode(MIN_LIMIT_PIN, INPUT_PULLUP);
     pinMode(MAX_LIMIT_PIN, INPUT_PULLUP);
@@ -277,6 +319,11 @@ void setup() {
 
     userScheduler.addTask(taskDiscovery);
     taskDiscovery.enable();
+
+#ifdef ENABLE_SIREN_OUTPUT
+    userScheduler.addTask(taskSiren);
+    taskSiren.enable();
+#endif
 }
 
 void loop() {
@@ -333,7 +380,7 @@ void sendHelloAck(uint32_t destMeshId) {
 
 /**
  * Polls inputs at 50 ms intervals.
- * Checks local RESET_ALARM_PIN (D5) to reset sticky latched alarm output.
+ * Checks local RESET_ALARM_PIN (D5) to reset sticky latched alarm output & silence siren.
  * Updates local safety clamping immediately without waiting for network timers.
  * Transmits CONTROL payloads EXCLUSIVELY via targeted UNICAST (sendSingle) with a strict MIN_TX_INTERVAL_MS rate limit.
  */
@@ -343,7 +390,11 @@ void checkAndTransmitInputs() {
         if (latchedDigitalOutputState || digitalRead(DIGITAL_OUTPUT_PIN) == HIGH) {
             latchedDigitalOutputState = false;
             digitalWrite(DIGITAL_OUTPUT_PIN, LOW);
-            Serial.println("[ALARM RESET] Local Reset Pin D5 pulled LOW -> Output memory cleared & D3 forced LOW.");
+#ifdef ENABLE_SIREN_OUTPUT
+            noTone(SIREN_PIN);
+            digitalWrite(SIREN_PIN, LOW);
+#endif
+            Serial.println("[ALARM RESET] Local Reset Pin D5 pulled LOW -> Output memory cleared, D3 & Siren forced LOW.");
         }
     }
 
@@ -459,7 +510,7 @@ void updateLocalServoFp4(uint16_t newRequestedUsFp4) {
 
 /**
  * Callback when a mesh message is received.
- * Strict Session Tuple Validation & Sticky Alarm Output Handling.
+ * Strict Session Tuple Validation, Sticky Alarm Output, and Siren Sound Control.
  */
 void receivedCallback(uint32_t from, String &msg) {
     // 1. Check for Handshake Messages (HELLO / HELLO_ACK)

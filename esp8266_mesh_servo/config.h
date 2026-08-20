@@ -33,23 +33,39 @@
 // Digital Output Pin (e.g. GPIO 0 / D3)
 #define DIGITAL_OUTPUT_PIN D3
 
+// Siren Audio Output Pin (e.g. GPIO 2 / D4)
+#define SIREN_PIN D4
+
+// Alarm Reset Pin (Active LOW with internal pull-up, e.g. GPIO 14 / D5)
+#define RESET_ALARM_PIN D5
+
 // Min Limit Switch Pin (Active LOW with internal pull-up, e.g. GPIO 12 / D6)
 #define MIN_LIMIT_PIN D6
 
 // Max Limit Switch Pin (Active LOW with internal pull-up, e.g. GPIO 13 / D7)
 #define MAX_LIMIT_PIN D7
 
-// Alarm Reset Pin (Active LOW with internal pull-up, e.g. GPIO 14 / D5)
-#define RESET_ALARM_PIN D5
+// ============================================================================
+// Alarm Feature Options
+// ============================================================================
 
-// ============================================================================
-// Alarm Latching Feature Option
-// ============================================================================
+// Option 1: Sticky Alarm Output Latching
 // Uncomment the line below to enable sticky alarm output latching.
 // When enabled, receiving a HIGH digital input state latches DIGITAL_OUTPUT_PIN
 // to HIGH permanently (even if door/switch closes again) until RESET_ALARM_PIN is pulled LOW.
 // Default: Disabled (standard non-latched mirroring).
 // #define LATCH_DIGITAL_OUTPUT_HIGH
+
+// Option 2: Siren Sound Output
+// Uncomment the line below to output a siren sound on SIREN_PIN (D4) whenever DIGITAL_OUTPUT_PIN (D3) is HIGH.
+// Default: Disabled.
+// #define ENABLE_SIREN_OUTPUT
+
+// Siren Audio Modulation Parameters
+#define SIREN_FREQ_LOW   600   // Low frequency in Hz
+#define SIREN_FREQ_HIGH  1200  // High frequency in Hz
+#define SIREN_STEP_HZ    20    // Frequency step per modulation tick
+#define SIREN_TICK_MS    10    // Modulation tick interval in milliseconds
 
 // ============================================================================
 // Servo Parameters & Microsecond Pulse Calibration

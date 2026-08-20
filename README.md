@@ -1,6 +1,6 @@
 # ESP8266 Bi-Directional Sensor & Servo Mesh (DSP & LUT Hardened)
 
-An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring sticky alarm digital output latching (`LATCH_DIGITAL_OUTPUT_HIGH`), local alarm reset pin (`RESET_ALARM_PIN` / D5), unified `PeerSession` tuple validation, handshake sequence tracking, fast Lookup-Table (LUT) hex encoding/decoding (`bytesToHex` / `hexToBytes`), CRC-16-CCITT checksum verification, handshake-only session installation (`session_id`), zero heap fragmentation, strict rate-limited unicast transmission, adaptive Kalman DSP filtering, traffic separation (unicast control vs. discovery broadcasts), active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, sub-microsecond fixed-point resolution, directional limit switch protection, and microsecond-level actuator control. This repository provides two firmware variants:
+An auto-organizing ESP8266 mesh network built using `painlessMesh` featuring non-blocking sweeping siren audio output (`ENABLE_SIREN_OUTPUT` on D4), sticky alarm digital output latching (`LATCH_DIGITAL_OUTPUT_HIGH`), local alarm reset pin (`RESET_ALARM_PIN` / D5), unified `PeerSession` tuple validation, handshake sequence tracking, fast Lookup-Table (LUT) hex encoding/decoding (`bytesToHex` / `hexToBytes`), CRC-16-CCITT checksum verification, handshake-only session installation (`session_id`), zero heap fragmentation, strict rate-limited unicast transmission, adaptive Kalman DSP filtering, traffic separation (unicast control vs. discovery broadcasts), active peer discovery handshakes (`HELLO`/`HELLO_ACK`), state machine target management, paired-sender packet filtering, sequence verification, sub-microsecond fixed-point resolution, directional limit switch protection, and microsecond-level actuator control. This repository provides two firmware variants:
 
 1. **`esp8266_mesh_pair`**: PWM & Digital IO version (transmits 1/sec periodic updates).
 2. **`esp8266_mesh_servo`**: Servo version (50ms input polling, 200ms strict network rate limiting, sub-microsecond FP4 fixed-point pulse transmission, directional limit switch safety clamping).
@@ -15,6 +15,7 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 |---|---|---|
 | **Input Polling Rate** | 1000 ms (1 Hz) | 50 ms (20 Hz local sampling, Wi-Fi PHY safe) |
 | **Network Transmission Rate** | Periodic (1/sec = 1000 ms) | Rate-limited (max 1 packet per 200 ms / 5 Hz) |
+| **Siren Sound Output Option** | Optional `#define ENABLE_SIREN_OUTPUT` on `D4` | Optional `#define ENABLE_SIREN_OUTPUT` on `D4` |
 | **Sticky Alarm Output Option**| Optional `#define LATCH_DIGITAL_OUTPUT_HIGH` with Reset Pin D5 | Optional `#define LATCH_DIGITAL_OUTPUT_HIGH` with Reset Pin D5 |
 | **Session Tracking** | Unified `PeerSession` tuple validation + Handshake Sequence Tracking | Unified `PeerSession` tuple validation + Handshake Sequence Tracking |
 | **Duplicate HELLO Handling** | ACK sent; DATA sequence counter (`lastDataSeq`) is NOT reset | ACK sent; DATA sequence counter (`lastDataSeq`) is NOT reset |
@@ -37,44 +38,22 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ---
 
-## 2. Sticky Alarm Latching & Reset Pin Logic
+## 2. Siren Sound Output & Sticky Alarm Logic
+
+### Siren Sound Output Mode (`#define ENABLE_SIREN_OUTPUT`)
+Outputs a sweeping dual-tone siren sound on `SIREN_PIN` (`D4` / GPIO 2) whenever `DIGITAL_OUTPUT_PIN` (`D3`) is `HIGH`:
+- **Default**: Disabled (`ENABLE_SIREN_OUTPUT` commented in `config.h`).
+- **Siren Enabled**: Uncomment `#define ENABLE_SIREN_OUTPUT` in `config.h`. A non-blocking `TaskScheduler` task modulates tone frequency between `600 Hz` and `1200 Hz` on `D4` whenever `D3` is `HIGH`.
+- **Automatic Silencing**: When `D3` drops `LOW` or when `RESET_ALARM_PIN` (D5) is pulled `LOW`, `noTone(SIREN_PIN)` immediately silences `D4`.
 
 ### Sticky Alarm Mode (`#define LATCH_DIGITAL_OUTPUT_HIGH`)
-For applications like door/window alarm switches where an opening event (pull-up bringing D2 to HIGH) must remain latched even if the door closes again:
-- **Default**: Disabled (`LATCH_DIGITAL_OUTPUT_HIGH` commented in `config.h`), performing standard non-latched mirroring (`D2` $\rightarrow$ `D3`).
-- **Sticky Alarm Enabled**: Uncomment `#define LATCH_DIGITAL_OUTPUT_HIGH` in `config.h`. When a HIGH digital input state arrives, `DIGITAL_OUTPUT_PIN` (D3) latches to HIGH permanently.
-- **Alarm Reset Pin (`RESET_ALARM_PIN` / D5)**: Pulling `RESET_ALARM_PIN` (D5) LOW (active LOW button/switch) immediately clears the latched memory and forces `DIGITAL_OUTPUT_PIN` (D3) to LOW.
+For door/window switches where opening events (D2 `HIGH`) must remain latched even after closing:
+- **Sticky Alarm Enabled**: Uncomment `#define LATCH_DIGITAL_OUTPUT_HIGH` in `config.h`. When a HIGH digital input arrives, `DIGITAL_OUTPUT_PIN` (D3) latches `HIGH` permanently.
+- **Alarm Reset Pin (`RESET_ALARM_PIN` / D5)**: Pulling `RESET_ALARM_PIN` (D5) `LOW` clears latched memory, forcing `D3` and Siren `D4` to `LOW`.
 
 ---
 
-## 3. Hardened PeerSession Tuple Validation & Protocol Architecture
-
-### Unified `PeerSession` Tuple State
-Session state tracking uses a complete tuple representation:
-```cpp
-struct PeerSession {
-    uint32_t  meshNodeId;      // Transport painlessMesh node ID
-    uint16_t  senderId;        // Application sender ID (TARGET_NODE_ID)
-    uint32_t  sessionId;       // Active boot session incarnation token
-    uint32_t  lastDataSeq;     // Last accepted DATA sequence number
-    uint32_t  lastHelloSeq;    // Last accepted HELLO handshake sequence number
-    PeerState state;          // UNKNOWN, DISCOVERING, CONNECTED
-    bool      hasDataSeq;      // Sequence initialization flag
-    bool      hasHelloSeq;     // Handshake sequence initialization flag
-};
-```
-
-### Handshake-Only Session Installation & Duplicate HELLO Protection
-- Replay/Duplicate HELLO frames from an already active session send a targeted `HELLO_ACK` reply, but **DO NOT reset `lastDataSeq`**.
-- Only authentic new session ID handshakes or newer handshake sequence numbers re-synchronize sequence counters.
-
-### Fast LUT Hex Encoding & CRC-16 Checksum Hardening
-- Replaces `sprintf` with a fast local lookup table (`HEX_LUT[] = "0123456789ABCDEF"`).
-- Every message structure includes a trailing 16-bit `crc16` field computed over all header and payload bytes (`calculateCRC16`).
-
----
-
-## 4. Hardware Requirements & Wiring
+## 3. Hardware Requirements & Wiring
 
 ### Pinout Summary
 | Function | ESP8266 Pin | Notes |
@@ -83,6 +62,7 @@ struct PeerSession {
 | **PWM Output / Servo Signal** | `D1` (GPIO 5) | PWM output in `esp8266_mesh_pair` or Microsecond Servo signal in `esp8266_mesh_servo` (544–2400 $\mu s$) |
 | **Digital Input** | `D2` (GPIO 4) | Input pin read by sending node (`INPUT_PULLUP`) |
 | **Digital Output** | `D3` (GPIO 0) | Output pin driven by received paired node digital state (`digitalWrite`) |
+| **Siren Sound Output** | `D4` (GPIO 2) | Sweeping dual-tone audio output whenever `D3` is `HIGH` (when `ENABLE_SIREN_OUTPUT` is enabled) |
 | **Alarm Reset Input** | `D5` (GPIO 14) | Resets sticky latched alarm output state to LOW (`INPUT_PULLUP`, Active LOW) |
 | **Min Limit Switch** | `D6` (GPIO 12) | Min position limit switch in `esp8266_mesh_servo` (Active LOW `INPUT_PULLUP`) |
 | **Max Limit Switch** | `D7` (GPIO 13) | Max position limit switch in `esp8266_mesh_servo` (Active LOW `INPUT_PULLUP`) |
@@ -90,12 +70,12 @@ struct PeerSession {
 
 ---
 
-## 5. Firmware Setup & Compilation
+## 4. Firmware Setup & Compilation
 
 ```bash
-# Compile Node 1 (MY_NODE_ID=1, TARGET_NODE_ID=2, with sticky alarm latching enabled)
+# Compile Node 1 (MY_NODE_ID=1, TARGET_NODE_ID=2, with siren output & sticky alarm enabled)
 arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 \
-  --build-property "build.extra_flags=-DMY_NODE_ID=1 -DTARGET_NODE_ID=2 -DLATCH_DIGITAL_OUTPUT_HIGH" \
+  --build-property "build.extra_flags=-DMY_NODE_ID=1 -DTARGET_NODE_ID=2 -DENABLE_SIREN_OUTPUT -DLATCH_DIGITAL_OUTPUT_HIGH" \
   esp8266_mesh_servo
 
 # Upload to Node 1
@@ -112,15 +92,17 @@ arduino-cli upload -p /dev/ttyUSB1 --fqbn esp8266:esp8266:nodemcuv2 esp8266_mesh
 
 ---
 
-## 6. Operation & Diagnostics
+## 5. Operation & Diagnostics
 
 ```text
 ==================================================
-ESP8266 Bi-directional Servo Mesh Node (Sticky Alarm Capable)
+ESP8266 Bi-directional Servo Mesh Node
 My Node ID: 1 (Session: 3849201) -> Target Node ID: 2
 Analog In: A0 (Adaptive Kahan+Kalman) | Servo Pin: GPIO 5 (D1) [544 - 2400 us]
-Digital In: GPIO 4 (D2) | Digital Out: GPIO 0 (D3) | Reset Alarm Pin: GPIO 14 (D5)
+Digital In: GPIO 4 (D2) | Digital Out: GPIO 0 (D3) | Siren Pin: GPIO 2 (D4)
+Min Limit Pin: GPIO 12 (D6) | Max Limit Pin: GPIO 13 (D7) | Reset Alarm Pin: GPIO 14 (D5)
 Option: LATCH_DIGITAL_OUTPUT_HIGH ENABLED (Sticky Alarm Mode)
+Option: ENABLE_SIREN_OUTPUT ENABLED (Siren Audio on D4 when D3 HIGH)
 ==================================================
 [DISCOVERY #1] Sent HELLO broadcast for Target Node 2 (Session: 3849201, CRC: 0xA3F1)
 [HANDSHAKE] Received HELLO_ACK from Target Node 2 (MeshID: 312847102, Session: 9812402). Transitioned to CONNECTED.
@@ -128,5 +110,5 @@ Option: LATCH_DIGITAL_OUTPUT_HIGH ENABLED (Sticky Alarm Mode)
 [TX #1] Filtered ADC: 512.35 | Target Pulse: 1472.25 us (FP4: 23556) | Unicast Queued: SUCCESS (CRC: 0xB4E2)
 [RX #1] From Node: 2 (Session: 9812402) | Target Pulse: 1950.12 us (FP4: 31202) | Digital: 1 | MinLim: 0 | MaxLim: 0
 [SERVO FP4] Requested: 1950.12 us (31202) -> Applied: 1950 us (31202 FP4) | LastSafe: 31202 FP4 (MinLim: 0, MaxLim: 0)
-[ALARM RESET] Local Reset Pin D5 pulled LOW -> Output memory cleared & D3 forced LOW.
+[ALARM RESET] Local Reset Pin D5 pulled LOW -> Output memory cleared, D3 & Siren forced LOW.
 ```
