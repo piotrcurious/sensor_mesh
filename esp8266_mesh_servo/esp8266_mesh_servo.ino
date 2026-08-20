@@ -1,18 +1,21 @@
 /*
-  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Hardened PeerSession Tuple Validation)
+  ESP8266 Bi-directional Servo & Sensor Mesh Node Firmware (Hardened PeerSession Tuple Validation & Sticky Alarm)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Hardening Enhancements:
+  - Sticky Digital Output Latching & Reset Pin:
+    * #define LATCH_DIGITAL_OUTPUT_HIGH option in config.h.
+    * When LATCH_DIGITAL_OUTPUT_HIGH is defined, receiving a HIGH digital input state latches
+      DIGITAL_OUTPUT_PIN to HIGH permanently until RESET_ALARM_PIN (D5) is pulled LOW.
+    * When RESET_ALARM_PIN is pulled LOW (active LOW button/switch), latched alarm memory resets
+      and DIGITAL_OUTPUT_PIN is forced to LOW immediately.
   - PeerSession Tuple Validation:
     * Replaces scalar variables with a unified PeerSession state structure:
       (meshNodeId, senderId, sessionId, lastDataSeq, lastHelloSeq, state).
   - Handshake Non-Reset Protection:
     * Duplicate HELLO / HELLO_ACK frames within the same session DO NOT reset lastDataSeq.
-    * Only authentic new session handshakes or newer HELLO sequences re-synchronize session parameters.
-    * Rejects stale/old HELLO packets from previous boots.
   - Strict DATA Frame Validation:
     * DATA frames are validated against the complete PeerSession tuple.
-    * DATA packets with invalid session_id, unverified transport node ID, or stale seq are DROPPED.
   - Fast Local Lookup Table (LUT) Hex Encoder / Decoder & CRC-16 Checksum.
   - Zero Heap Allocation Strategy (static reserved txPayloadString).
   - Sub-microsecond Fixed-Point Precision (FP4 = 1/16th us resolution).
@@ -50,6 +53,9 @@ Task taskDiscovery(DISCOVERY_INTERVAL_MS, TASK_FOREVER, &sendHelloDiscovery);
 
 // Local Boot Session Incarnation ID
 static uint32_t mySessionId = 0;
+
+// Latched digital output memory state (for sticky alarm mode)
+static bool latchedDigitalOutputState = false;
 
 // Unified PeerSession State Structure
 struct PeerSession {
@@ -227,12 +233,18 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (PeerSession Tuple Validated)\n");
+    Serial.printf("ESP8266 Bi-directional Servo Mesh Node (Sticky Alarm Capable)\n");
     Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (Adaptive Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
                   SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
     Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
-    Serial.printf("Min Limit Pin: GPIO %d (D6) | Max Limit Pin: GPIO %d (D7)\n", MIN_LIMIT_PIN, MAX_LIMIT_PIN);
+    Serial.printf("Min Limit Pin: GPIO %d (D6) | Max Limit Pin: GPIO %d (D7) | Reset Alarm Pin: GPIO %d (D5)\n",
+                  MIN_LIMIT_PIN, MAX_LIMIT_PIN, RESET_ALARM_PIN);
+#ifdef LATCH_DIGITAL_OUTPUT_HIGH
+    Serial.println("Option: LATCH_DIGITAL_OUTPUT_HIGH ENABLED (Sticky Alarm Mode)");
+#else
+    Serial.println("Option: LATCH_DIGITAL_OUTPUT_HIGH DISABLED (Standard Mirroring)");
+#endif
     Serial.println("==================================================");
 
     // Initialize hardware pins
@@ -243,6 +255,7 @@ void setup() {
 
     pinMode(MIN_LIMIT_PIN, INPUT_PULLUP);
     pinMode(MAX_LIMIT_PIN, INPUT_PULLUP);
+    pinMode(RESET_ALARM_PIN, INPUT_PULLUP);
 
     // Initialize Kalman state
     kalman_x = (float)analogRead(SENSOR_PIN);
@@ -320,9 +333,20 @@ void sendHelloAck(uint32_t destMeshId) {
 
 /**
  * Polls inputs at 50 ms intervals.
+ * Checks local RESET_ALARM_PIN (D5) to reset sticky latched alarm output.
+ * Updates local safety clamping immediately without waiting for network timers.
  * Transmits CONTROL payloads EXCLUSIVELY via targeted UNICAST (sendSingle) with a strict MIN_TX_INTERVAL_MS rate limit.
  */
 void checkAndTransmitInputs() {
+    // Check local RESET_ALARM_PIN (D5, active LOW)
+    if (digitalRead(RESET_ALARM_PIN) == LOW) {
+        if (latchedDigitalOutputState || digitalRead(DIGITAL_OUTPUT_PIN) == HIGH) {
+            latchedDigitalOutputState = false;
+            digitalWrite(DIGITAL_OUTPUT_PIN, LOW);
+            Serial.println("[ALARM RESET] Local Reset Pin D5 pulled LOW -> Output memory cleared & D3 forced LOW.");
+        }
+    }
+
     float filteredAdc = readAnalogFiltered();
 
     float targetPulseUs = (float)SERVO_MIN_PULSE_WIDTH + (filteredAdc / 1023.0f) * (float)(SERVO_MAX_PULSE_WIDTH - SERVO_MIN_PULSE_WIDTH);
@@ -435,17 +459,16 @@ void updateLocalServoFp4(uint16_t newRequestedUsFp4) {
 
 /**
  * Callback when a mesh message is received.
- * Strict Session Tuple Validation & Duplicate HELLO Sequence Protection.
+ * Strict Session Tuple Validation & Sticky Alarm Output Handling.
  */
 void receivedCallback(uint32_t from, String &msg) {
-    // 1. Check for Handshake Messages (HELLO / HELLO_ACK) - EXCLUSIVE session installation mechanism
+    // 1. Check for Handshake Messages (HELLO / HELLO_ACK)
     if (msg.length() == HANDSHAKE_WIRE_HEX_LEN) {
         HandshakeMessage handshake{};
         if (!hexToBytes(msg, (uint8_t*)&handshake, sizeof(HandshakeMessage))) {
             return;
         }
 
-        // Verify CRC16 Checksum
         uint16_t expectedCrc = calculateCRC16((const uint8_t*)&handshake, sizeof(HandshakeMessage) - sizeof(uint16_t));
         if (handshake.crc16 != expectedCrc) {
             Serial.printf("[RX CRC REJECT] Handshake CRC mismatch: received 0x%04X, expected 0x%04X\n",
@@ -476,7 +499,6 @@ void receivedCallback(uint32_t from, String &msg) {
                     }
                     sendHelloAck(from);
                 } else {
-                    // Duplicate/Old HELLO inside current session -> reply ACK but DO NOT reset DATA sequence!
                     Serial.printf("[HANDSHAKE] Duplicate HELLO (Session: %u, HelloSeq: %u). Sending ACK without DATA seq reset.\n",
                                   handshake.session_id, handshake.seq);
                     sendHelloAck(from);
@@ -506,12 +528,10 @@ void receivedCallback(uint32_t from, String &msg) {
         return;
     }
 
-    // TUPLE VALIDATION RULE 1: Must be in CONNECTED state
     if (peerSession.state != PeerState::CONNECTED) {
         return;
     }
 
-    // TUPLE VALIDATION RULE 2: Must originate from active peerSession.meshNodeId
     if (from != peerSession.meshNodeId) {
         Serial.printf("[RX REJECT] DATA payload from unverified MeshID %u (Active Target MeshID: %u)\n",
                       from, peerSession.meshNodeId);
@@ -523,7 +543,6 @@ void receivedCallback(uint32_t from, String &msg) {
         return;
     }
 
-    // Verify CRC16 Checksum
     uint16_t expectedCrc = calculateCRC16((const uint8_t*)&incoming, sizeof(ServoMeshMessage) - sizeof(uint16_t));
     if (incoming.crc16 != expectedCrc) {
         Serial.printf("[RX CRC REJECT] Data Payload CRC mismatch: received 0x%04X, expected 0x%04X\n",
@@ -535,22 +554,18 @@ void receivedCallback(uint32_t from, String &msg) {
         return;
     }
 
-    // TUPLE VALIDATION RULE 3: Explicit Sender & Target Validation
     if (incoming.sender_id != TARGET_NODE_ID || incoming.target_id != MY_NODE_ID) {
         return;
     }
 
-    // TUPLE VALIDATION RULE 4: Strict Active Session ID Matching
-    // DATA payloads CANNOT establish or reset sessions. Stale or unauthenticated session IDs are DROPPED.
     if (incoming.session_id != peerSession.sessionId) {
         Serial.printf("[RX SESSION REJECT] Dropped DATA with stale/unmatched Session ID %u (Active Session: %u)\n",
                       incoming.session_id, peerSession.sessionId);
         return;
     }
 
-    // TUPLE VALIDATION RULE 5: Sequence Check for active session
     if (!isNewerSequence(incoming.seq, peerSession.lastDataSeq, peerSession.hasDataSeq)) {
-        Serial.printf("[RX DROP #%u] Out-of-order or duplicate DATA packet dropped (Last Seq: %u, Session: %u)\n",
+        Serial.printf("[RX DROP #%u] Out-of-order or duplicate DATA packet dropped (Last Seq: %u, Sender Session: %u)\n",
                       incoming.seq, peerSession.lastDataSeq, incoming.session_id);
         return;
     }
@@ -558,8 +573,16 @@ void receivedCallback(uint32_t from, String &msg) {
     peerSession.lastDataSeq = incoming.seq;
     peerSession.hasDataSeq = true;
 
-    // Update local digital output (D3)
-    digitalWrite(DIGITAL_OUTPUT_PIN, incoming.digital_value ? HIGH : LOW);
+    // Digital output handling (Supports optional sticky alarm latching)
+#ifdef LATCH_DIGITAL_OUTPUT_HIGH
+    if (incoming.digital_value) {
+        latchedDigitalOutputState = true;
+    }
+    digitalWrite(DIGITAL_OUTPUT_PIN, latchedDigitalOutputState ? HIGH : LOW);
+#else
+    uint8_t digitalState = incoming.digital_value ? HIGH : LOW;
+    digitalWrite(DIGITAL_OUTPUT_PIN, digitalState);
+#endif
 
     // Update local servo
     updateLocalServoFp4(incoming.target_us_fp4);
@@ -573,10 +596,6 @@ void newConnectionCallback(uint32_t nodeId) {
     Serial.printf("[MESH] New Connection, nodeId = %u (Local Mesh Node ID = %u)\n", nodeId, mesh.getNodeId());
 }
 
-/**
- * Handles topology changes: verifies if peerSession.meshNodeId is still present in current node list.
- * If disconnected, resets peerSession.meshNodeId and transitions peerSession.state to DISCOVERING.
- */
 void changedConnectionCallback() {
     Serial.printf("[MESH] Topology changed (Local Mesh Node ID = %u)\n", mesh.getNodeId());
 

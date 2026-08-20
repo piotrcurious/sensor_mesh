@@ -1,20 +1,25 @@
 /*
-  ESP8266 Bi-directional Sensor Mesh Node Firmware (Hardened PeerSession Tuple Validation)
+  ESP8266 Bi-directional Sensor Mesh Node Firmware (Hardened PeerSession Tuple Validation & Sticky Alarm)
   Uses painlessMesh to create an auto-organizing mesh network.
 
   Fixes & Hardening Enhancements:
+  - Sticky Digital Output Latching & Reset Pin:
+    * #define LATCH_DIGITAL_OUTPUT_HIGH option in config.h.
+    * When LATCH_DIGITAL_OUTPUT_HIGH is defined, receiving a HIGH digital input state latches
+      DIGITAL_OUTPUT_PIN to HIGH permanently until RESET_ALARM_PIN (D5) is pulled LOW.
+    * When RESET_ALARM_PIN is pulled LOW (active LOW button/switch), latched alarm memory resets
+      and DIGITAL_OUTPUT_PIN is forced to LOW immediately.
   - PeerSession Tuple Validation:
     * Replaces scalar variables with a unified PeerSession state structure:
       (meshNodeId, senderId, sessionId, lastDataSeq, lastHelloSeq, state).
   - Handshake Non-Reset Protection:
     * Duplicate HELLO / HELLO_ACK frames within the same session DO NOT reset lastDataSeq.
-    * Only authentic new session handshakes or newer HELLO sequences re-synchronize session parameters.
-    * Rejects stale/old HELLO packets from previous boots.
   - Strict DATA Frame Validation:
     * DATA frames are validated against the complete PeerSession tuple.
-    * DATA packets with invalid session_id, unverified transport node ID, or stale seq are DROPPED.
   - Fast Local Lookup Table (LUT) Hex Encoder / Decoder & CRC-16 Checksum.
   - Zero Heap Allocation Strategy (static reserved txPayloadString).
+  - High-Precision DSP filtering (Kahan summation, outlier rejection, 1D Kalman filter).
+  - Drives PWM pin (D1) and digital output pin (D3).
 */
 
 #include <painlessMesh.h>
@@ -45,6 +50,9 @@ Task taskDiscovery(DISCOVERY_INTERVAL_MS, TASK_FOREVER, &sendHelloDiscovery);
 
 // Local Boot Session Incarnation ID
 static uint32_t mySessionId = 0;
+
+// Latched digital output memory state (for sticky alarm mode)
+static bool latchedDigitalOutputState = false;
 
 // Unified PeerSession State Structure
 struct PeerSession {
@@ -213,10 +221,16 @@ void setup() {
 
     Serial.println();
     Serial.println("==================================================");
-    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (PeerSession Tuple Validated)\n");
+    Serial.printf("ESP8266 Bi-directional Sensor Mesh Node (Sticky Alarm Capable)\n");
     Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (DSP Kahan+Kalman) | PWM Out: GPIO %d (D1)\n", PWM_PIN);
-    Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n", DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
+    Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3) | Reset Alarm Pin: GPIO %d (D5)\n",
+                  DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN, RESET_ALARM_PIN);
+#ifdef LATCH_DIGITAL_OUTPUT_HIGH
+    Serial.println("Option: LATCH_DIGITAL_OUTPUT_HIGH ENABLED (Sticky Alarm Mode)");
+#else
+    Serial.println("Option: LATCH_DIGITAL_OUTPUT_HIGH DISABLED (Standard Mirroring)");
+#endif
     Serial.println("==================================================");
 
     // Initialize hardware pins
@@ -227,6 +241,7 @@ void setup() {
     pinMode(DIGITAL_INPUT_PIN, INPUT_PULLUP);
     pinMode(DIGITAL_OUTPUT_PIN, OUTPUT);
     digitalWrite(DIGITAL_OUTPUT_PIN, LOW);
+    pinMode(RESET_ALARM_PIN, INPUT_PULLUP);
 
     // Initialize Kalman state
     kalman_x = (float)analogRead(SENSOR_PIN);
@@ -304,6 +319,15 @@ void sendHelloAck(uint32_t destMeshId) {
  * hex-encodes it, and sends CONTROL payload EXCLUSIVELY via targeted UNICAST (sendSingle).
  */
 void sendSensorData() {
+    // Check local RESET_ALARM_PIN (D5, active LOW)
+    if (digitalRead(RESET_ALARM_PIN) == LOW) {
+        if (latchedDigitalOutputState || digitalRead(DIGITAL_OUTPUT_PIN) == HIGH) {
+            latchedDigitalOutputState = false;
+            digitalWrite(DIGITAL_OUTPUT_PIN, LOW);
+            Serial.println("[ALARM RESET] Local Reset Pin D5 pulled LOW -> Output memory cleared & D3 forced LOW.");
+        }
+    }
+
     if (peerSession.state != PeerState::CONNECTED || peerSession.meshNodeId == 0 || !mesh.isConnected(peerSession.meshNodeId)) {
         return;
     }
@@ -343,10 +367,10 @@ void sendSensorData() {
 
 /**
  * Callback when a mesh message is received.
- * Strict Session Tuple Validation & Duplicate HELLO Sequence Protection.
+ * Strict Session Tuple Validation & Sticky Alarm Output Handling.
  */
 void receivedCallback(uint32_t from, String &msg) {
-    // 1. Check for Handshake Messages (HELLO / HELLO_ACK) - EXCLUSIVE session installation mechanism
+    // 1. Check for Handshake Messages (HELLO / HELLO_ACK)
     if (msg.length() == HANDSHAKE_WIRE_HEX_LEN) {
         HandshakeMessage handshake{};
         if (!hexToBytes(msg, (uint8_t*)&handshake, sizeof(HandshakeMessage))) {
@@ -457,6 +481,18 @@ void receivedCallback(uint32_t from, String &msg) {
     peerSession.lastDataSeq = incoming.seq;
     peerSession.hasDataSeq = true;
 
+    // Digital output handling (Supports optional sticky alarm latching)
+#ifdef LATCH_DIGITAL_OUTPUT_HIGH
+    if (incoming.digital_value) {
+        latchedDigitalOutputState = true;
+    }
+    digitalWrite(DIGITAL_OUTPUT_PIN, latchedDigitalOutputState ? HIGH : LOW);
+#else
+    uint8_t digitalState = incoming.digital_value ? HIGH : LOW;
+    digitalWrite(DIGITAL_OUTPUT_PIN, digitalState);
+#endif
+
+    // Map sensor value (0-1023) to PWM range
     uint16_t pwmValue = incoming.sensor_value;
     if (pwmValue > PWM_RANGE) {
         pwmValue = PWM_RANGE;
@@ -464,11 +500,9 @@ void receivedCallback(uint32_t from, String &msg) {
 
     analogWrite(PWM_PIN, pwmValue);
 
-    uint8_t digitalState = incoming.digital_value ? HIGH : LOW;
-    digitalWrite(DIGITAL_OUTPUT_PIN, digitalState);
-
     Serial.printf("[RX #%u] From Node: %u (Session: %u) | Analog: %u -> PWM Duty: %u/%d | Digital D2 -> D3: %u (Mesh NodeID: %u)\n",
-                  incoming.seq, incoming.sender_id, incoming.session_id, incoming.sensor_value, pwmValue, PWM_RANGE, digitalState, from);
+                  incoming.seq, incoming.sender_id, incoming.session_id, incoming.sensor_value, pwmValue, PWM_RANGE,
+                  digitalRead(DIGITAL_OUTPUT_PIN), from);
 }
 
 void newConnectionCallback(uint32_t nodeId) {

@@ -39,6 +39,18 @@
 // Max Limit Switch Pin (Active LOW with internal pull-up, e.g. GPIO 13 / D7)
 #define MAX_LIMIT_PIN D7
 
+// Alarm Reset Pin (Active LOW with internal pull-up, e.g. GPIO 14 / D5)
+#define RESET_ALARM_PIN D5
+
+// ============================================================================
+// Alarm Latching Feature Option
+// ============================================================================
+// Uncomment the line below to enable sticky alarm output latching.
+// When enabled, receiving a HIGH digital input state latches DIGITAL_OUTPUT_PIN
+// to HIGH permanently (even if door/switch closes again) until RESET_ALARM_PIN is pulled LOW.
+// Default: Disabled (standard non-latched mirroring).
+// #define LATCH_DIGITAL_OUTPUT_HIGH
+
 // ============================================================================
 // Servo Parameters & Microsecond Pulse Calibration
 // ============================================================================
@@ -93,7 +105,7 @@
 // Compact Binary Struct Definitions (Includes Session ID & CRC16)
 // ============================================================================
 
-// Data Payload Struct (20 bytes: 1+2+2+4+2+1+1+1+4+2 = 20 bytes packed)
+// Data Payload Struct (20 bytes packed)
 struct __attribute__((__packed__)) ServoMeshMessage {
     uint8_t  magic;            // 1 byte  (MSG_TYPE_DATA = 0xBA)
     uint16_t sender_id;        // 2 bytes
@@ -107,7 +119,7 @@ struct __attribute__((__packed__)) ServoMeshMessage {
     uint16_t crc16;            // 2 bytes CRC16 checksum
 };
 
-// Handshake Discovery Struct (15 bytes: 1+2+2+4+4+2 = 15 bytes packed)
+// Handshake Discovery Struct (15 bytes packed)
 struct __attribute__((__packed__)) HandshakeMessage {
     uint8_t  magic;            // 1 byte  (MSG_TYPE_HELLO / MSG_TYPE_HELLO_ACK)
     uint16_t sender_id;        // 2 bytes
