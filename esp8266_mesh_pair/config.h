@@ -33,9 +33,6 @@
 // Digital Output Pin (receiving node)
 #define DIGITAL_OUTPUT_PIN D3
 
-// Siren Audio Output Pin (e.g. GPIO 2 / D4)
-#define SIREN_PIN D4
-
 // Alarm Reset Pin (Active LOW with internal pull-up, e.g. GPIO 14 / D5)
 #define RESET_ALARM_PIN D5
 
@@ -55,14 +52,19 @@
 
 // Option 2: Siren Sound Output
 // Uncomment the line below to output a siren sound on SIREN_PIN (D4) whenever DIGITAL_OUTPUT_PIN (D3) is HIGH.
-// Default: Disabled.
+// Default: Disabled (pin D4 freed for general GPIO use).
 // #define ENABLE_SIREN_OUTPUT
+
+#ifdef ENABLE_SIREN_OUTPUT
+// Siren Audio Output Pin (e.g. GPIO 2 / D4)
+#define SIREN_PIN D4
 
 // Siren Audio Modulation Parameters
 #define SIREN_FREQ_LOW   600   // Low frequency in Hz
 #define SIREN_FREQ_HIGH  1200  // High frequency in Hz
 #define SIREN_STEP_HZ    20    // Frequency step per modulation tick
 #define SIREN_TICK_MS    10    // Modulation tick interval in milliseconds
+#endif
 
 // ============================================================================
 // Mesh Network Configuration

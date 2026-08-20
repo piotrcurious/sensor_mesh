@@ -42,8 +42,9 @@ Both versions allow creating paired ESP8266 nodes (configured with simple compil
 
 ### Siren Sound Output Mode (`#define ENABLE_SIREN_OUTPUT`)
 Outputs a sweeping dual-tone siren sound on `SIREN_PIN` (`D4` / GPIO 2) whenever `DIGITAL_OUTPUT_PIN` (`D3`) is `HIGH`:
-- **Default**: Disabled (`ENABLE_SIREN_OUTPUT` commented in `config.h`).
+- **Default**: Disabled (`ENABLE_SIREN_OUTPUT` commented out in `config.h`), freeing up pin `D4` for general GPIO use.
 - **Siren Enabled**: Uncomment `#define ENABLE_SIREN_OUTPUT` in `config.h`. A non-blocking `TaskScheduler` task modulates tone frequency between `600 Hz` and `1200 Hz` on `D4` whenever `D3` is `HIGH`.
+- **Guarded Macros**: All siren tasks, functions, variables, and pin initializations are strictly guarded inside `#ifdef ENABLE_SIREN_OUTPUT` blocks.
 - **Automatic Silencing**: When `D3` drops `LOW` or when `RESET_ALARM_PIN` (D5) is pulled `LOW`, `noTone(SIREN_PIN)` immediately silences `D4`.
 
 ### Sticky Alarm Mode (`#define LATCH_DIGITAL_OUTPUT_HIGH`)
@@ -62,7 +63,7 @@ For door/window switches where opening events (D2 `HIGH`) must remain latched ev
 | **PWM Output / Servo Signal** | `D1` (GPIO 5) | PWM output in `esp8266_mesh_pair` or Microsecond Servo signal in `esp8266_mesh_servo` (544–2400 $\mu s$) |
 | **Digital Input** | `D2` (GPIO 4) | Input pin read by sending node (`INPUT_PULLUP`) |
 | **Digital Output** | `D3` (GPIO 0) | Output pin driven by received paired node digital state (`digitalWrite`) |
-| **Siren Sound Output** | `D4` (GPIO 2) | Sweeping dual-tone audio output whenever `D3` is `HIGH` (when `ENABLE_SIREN_OUTPUT` is enabled) |
+| **Siren Sound Output** | `D4` (GPIO 2) | Sweeping dual-tone audio output whenever `D3` is `HIGH` (Guarded by `#ifdef ENABLE_SIREN_OUTPUT`, freed when disabled) |
 | **Alarm Reset Input** | `D5` (GPIO 14) | Resets sticky latched alarm output state to LOW (`INPUT_PULLUP`, Active LOW) |
 | **Min Limit Switch** | `D6` (GPIO 12) | Min position limit switch in `esp8266_mesh_servo` (Active LOW `INPUT_PULLUP`) |
 | **Max Limit Switch** | `D7` (GPIO 13) | Max position limit switch in `esp8266_mesh_servo` (Active LOW `INPUT_PULLUP`) |
