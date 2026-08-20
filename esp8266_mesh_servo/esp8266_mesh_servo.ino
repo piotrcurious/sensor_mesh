@@ -4,10 +4,10 @@
 
   Fixes & Hardening Enhancements:
   - Non-blocking Siren Audio Output:
-    * #define ENABLE_SIREN_OUTPUT option in config.h.
+    * Fully guarded by #ifdef ENABLE_SIREN_OUTPUT in config.h and sketch.
     * When ENABLE_SIREN_OUTPUT is defined and DIGITAL_OUTPUT_PIN (D3) is HIGH,
       modulates a sweeping dual-tone siren sound on SIREN_PIN (D4 / GPIO 2) non-blockingly.
-    * When DIGITAL_OUTPUT_PIN is LOW, silences SIREN_PIN via noTone(SIREN_PIN).
+    * When ENABLE_SIREN_OUTPUT is disabled, pin D4 is freed up completely for general GPIO use.
   - Sticky Digital Output Latching & Reset Pin:
     * #define LATCH_DIGITAL_OUTPUT_HIGH option in config.h with RESET_ALARM_PIN (D5).
   - PeerSession Tuple Validation & Handshake-Only Sessions.
@@ -28,7 +28,9 @@ Servo myServo;
 // Function declarations
 void checkAndTransmitInputs();
 void sendHelloDiscovery();
+#ifdef ENABLE_SIREN_OUTPUT
 void updateSirenAudio();
+#endif
 void receivedCallback(uint32_t from, String &msg);
 void newConnectionCallback(uint32_t nodeId);
 void changedConnectionCallback();
@@ -46,18 +48,20 @@ Task taskPollInputs(POLL_INTERVAL_MS, TASK_FOREVER, &checkAndTransmitInputs);
 // Discovery task (1000 ms retry while DISCOVERING)
 Task taskDiscovery(DISCOVERY_INTERVAL_MS, TASK_FOREVER, &sendHelloDiscovery);
 
+#ifdef ENABLE_SIREN_OUTPUT
 // Siren Modulation Task (10 ms tick for non-blocking sweeping audio)
 Task taskSiren(SIREN_TICK_MS, TASK_FOREVER, &updateSirenAudio);
+
+// Siren Audio State Tracking
+static uint16_t currentSirenFreq = SIREN_FREQ_LOW;
+static bool     sirenSweepRising  = true;
+#endif
 
 // Local Boot Session Incarnation ID
 static uint32_t mySessionId = 0;
 
 // Latched digital output memory state (for sticky alarm mode)
 static bool latchedDigitalOutputState = false;
-
-// Siren Audio State Tracking
-static uint16_t currentSirenFreq = SIREN_FREQ_LOW;
-static bool     sirenSweepRising  = true;
 
 // Unified PeerSession State Structure
 struct PeerSession {
@@ -153,12 +157,12 @@ bool hexToBytes(const String& hexStr, uint8_t* dest, size_t destLen) {
     return true;
 }
 
+#ifdef ENABLE_SIREN_OUTPUT
 /**
  * Non-blocking Siren Audio Generator:
  * Modulates sweeping tone frequency on SIREN_PIN whenever DIGITAL_OUTPUT_PIN is HIGH.
  */
 void updateSirenAudio() {
-#ifdef ENABLE_SIREN_OUTPUT
     if (digitalRead(DIGITAL_OUTPUT_PIN) == HIGH) {
         if (sirenSweepRising) {
             currentSirenFreq += SIREN_STEP_HZ;
@@ -181,8 +185,8 @@ void updateSirenAudio() {
         currentSirenFreq = SIREN_FREQ_LOW;
         sirenSweepRising = true;
     }
-#endif
 }
+#endif
 
 /**
  * Wraparound-safe 32-bit sequence comparison.
@@ -270,8 +274,11 @@ void setup() {
     Serial.printf("My Node ID: %u (Session: %u) -> Target Node ID: %u\n", MY_NODE_ID, mySessionId, TARGET_NODE_ID);
     Serial.printf("Analog In: A0 (Adaptive Kahan+Kalman) | Servo Pin: GPIO %d (D1) [%d - %d us]\n",
                   SERVO_PIN, SERVO_MIN_PULSE_WIDTH, SERVO_MAX_PULSE_WIDTH);
-    Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3) | Siren Pin: GPIO %d (D4)\n",
-                  DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN, SIREN_PIN);
+    Serial.printf("Digital In: GPIO %d (D2) | Digital Out: GPIO %d (D3)\n",
+                  DIGITAL_INPUT_PIN, DIGITAL_OUTPUT_PIN);
+#ifdef ENABLE_SIREN_OUTPUT
+    Serial.printf("Siren Pin: GPIO %d (D4)\n", SIREN_PIN);
+#endif
     Serial.printf("Min Limit Pin: GPIO %d (D6) | Max Limit Pin: GPIO %d (D7) | Reset Alarm Pin: GPIO %d (D5)\n",
                   MIN_LIMIT_PIN, MAX_LIMIT_PIN, RESET_ALARM_PIN);
 #ifdef LATCH_DIGITAL_OUTPUT_HIGH
@@ -282,7 +289,7 @@ void setup() {
 #ifdef ENABLE_SIREN_OUTPUT
     Serial.println("Option: ENABLE_SIREN_OUTPUT ENABLED (Siren Audio on D4 when D3 HIGH)");
 #else
-    Serial.println("Option: ENABLE_SIREN_OUTPUT DISABLED");
+    Serial.println("Option: ENABLE_SIREN_OUTPUT DISABLED (Pin D4 freed for general GPIO use)");
 #endif
     Serial.println("==================================================");
 
@@ -292,8 +299,10 @@ void setup() {
     pinMode(DIGITAL_OUTPUT_PIN, OUTPUT);
     digitalWrite(DIGITAL_OUTPUT_PIN, LOW);
 
+#ifdef ENABLE_SIREN_OUTPUT
     pinMode(SIREN_PIN, OUTPUT);
     digitalWrite(SIREN_PIN, LOW);
+#endif
 
     pinMode(MIN_LIMIT_PIN, INPUT_PULLUP);
     pinMode(MAX_LIMIT_PIN, INPUT_PULLUP);
@@ -380,7 +389,7 @@ void sendHelloAck(uint32_t destMeshId) {
 
 /**
  * Polls inputs at 50 ms intervals.
- * Checks local RESET_ALARM_PIN (D5) to reset sticky latched alarm output & silence siren.
+ * Checks local RESET_ALARM_PIN (D5) to reset sticky latched alarm output & silence siren if enabled.
  * Updates local safety clamping immediately without waiting for network timers.
  * Transmits CONTROL payloads EXCLUSIVELY via targeted UNICAST (sendSingle) with a strict MIN_TX_INTERVAL_MS rate limit.
  */
@@ -394,7 +403,7 @@ void checkAndTransmitInputs() {
             noTone(SIREN_PIN);
             digitalWrite(SIREN_PIN, LOW);
 #endif
-            Serial.println("[ALARM RESET] Local Reset Pin D5 pulled LOW -> Output memory cleared, D3 & Siren forced LOW.");
+            Serial.println("[ALARM RESET] Local Reset Pin D5 pulled LOW -> Output memory cleared & D3 forced LOW.");
         }
     }
 
