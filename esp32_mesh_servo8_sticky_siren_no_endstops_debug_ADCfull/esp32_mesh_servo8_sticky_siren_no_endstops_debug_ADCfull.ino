@@ -24,6 +24,7 @@ void sendHelloDiscovery();
 
 #ifdef ENABLE_SIREN_OUTPUT
 void updateSirenAudio();
+void stopSirenAudio();
 #endif
 
 void receivedCallback(uint32_t from, String &msg);
@@ -83,6 +84,8 @@ Task taskSiren(
 
 static uint16_t currentSirenFreq = SIREN_FREQ_LOW;
 static bool sirenSweepRising = true;
+static ESP32PWM sirenPWM;
+static bool sirenAttached = false;
 
 #endif
 
@@ -272,6 +275,17 @@ bool hexToBytes(
 
 #ifdef ENABLE_SIREN_OUTPUT
 
+void stopSirenAudio() {
+    if (sirenAttached) {
+        sirenPWM.detachPin(SIREN_PIN);
+        sirenAttached = false;
+    }
+    digitalWrite(SIREN_PIN, LOW);
+
+    currentSirenFreq = SIREN_FREQ_LOW;
+    sirenSweepRising = true;
+}
+
 void updateSirenAudio() {
 
     if (digitalRead(DIGITAL_OUTPUT_PIN) == HIGH) {
@@ -300,18 +314,14 @@ void updateSirenAudio() {
             }
         }
 
-        tone(
-            SIREN_PIN,
-            currentSirenFreq
-        );
+        if (!sirenAttached) {
+            sirenPWM.attachPin(SIREN_PIN, currentSirenFreq, 10);
+            sirenAttached = true;
+        }
+        sirenPWM.writeTone(currentSirenFreq);
 
     } else {
-
-        noTone(SIREN_PIN);
-        digitalWrite(SIREN_PIN, LOW);
-
-        currentSirenFreq = SIREN_FREQ_LOW;
-        sirenSweepRising = true;
+        stopSirenAudio();
     }
 }
 
@@ -689,9 +699,20 @@ void setup() {
         (float)analogRead(SENSOR_PIN);
 
     // ------------------------------------------------------------------------
-    // Servo
+    // ESP32PWM LEDC Timer Allocation & Servo Configuration
+    // ------------------------------------------------------------------------
+    // On ESP32, ESP32Servo and tone audio rely on hardware LEDC timers.
+    // Explicitly allocating timers (0..3) puts ESP32PWM into explicit mode,
+    // allowing ESP32PWM to safely isolate servo (50Hz) and siren tone
+    // frequencies onto separate LEDC timers without timer corruption.
     // ------------------------------------------------------------------------
 
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+    ESP32PWM::allocateTimer(2);
+    ESP32PWM::allocateTimer(3);
+
+    myServo.setPeriodHertz(50);
     myServo.attach(
         SERVO_PIN,
         SERVO_MIN_PULSE_WIDTH,
@@ -953,12 +974,7 @@ void checkAndTransmitInputs() {
 
 #ifdef ENABLE_SIREN_OUTPUT
 
-            noTone(SIREN_PIN);
-
-            digitalWrite(
-                SIREN_PIN,
-                LOW
-            );
+            stopSirenAudio();
 
 #endif
 
